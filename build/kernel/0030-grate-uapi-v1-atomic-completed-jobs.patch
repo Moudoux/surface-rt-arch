@@ -1,0 +1,47 @@
+diff --git a/drivers/gpu/drm/grate/uapi/job_v1.c b/drivers/gpu/drm/grate/uapi/job_v1.c
+index b5703cffe..e89215ddb 100644
+--- a/drivers/gpu/drm/grate/uapi/job_v1.c
++++ b/drivers/gpu/drm/grate/uapi/job_v1.c
+@@ -96,7 +96,7 @@ static void tegra_drm_free_job_v1(struct work_struct *work)
+ 	atomic_t *num_active_jobs = job->num_active_jobs;
+ 
+ 	if (job_v1->scheduled) {
+-		context->completed_jobs++;
++		atomic_inc(&context->completed_jobs);
+ 		wake_up_all(&context->wq);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/grate/uapi/uapi.c b/drivers/gpu/drm/grate/uapi/uapi.c
+index 86c184abb..b56930346 100644
+--- a/drivers/gpu/drm/grate/uapi/uapi.c
++++ b/drivers/gpu/drm/grate/uapi/uapi.c
+@@ -91,7 +91,7 @@ int tegra_uapi_syncpt_wait(struct drm_device *drm, void *data,
+ 	}
+ 
+ 	ret = wait_event_interruptible_timeout(context->wq,
+-				tegra_uapi_v1_done(context->completed_jobs,
++				tegra_uapi_v1_done(atomic_read(&context->completed_jobs),
+ 						   args->thresh),
+ 				msecs_to_jiffies(args->timeout));
+ 
+diff --git a/drivers/gpu/drm/grate/uapi/uapi.h b/drivers/gpu/drm/grate/uapi/uapi.h
+index e869ade51..180c5f508 100644
+--- a/drivers/gpu/drm/grate/uapi/uapi.h
++++ b/drivers/gpu/drm/grate/uapi/uapi.h
+@@ -18,8 +18,14 @@ struct tegra_drm_context_v1 {
+ 	unsigned int host1x_class;
+ 	struct wait_queue_head wq;
+ 	struct kref refcount;
+-	u32 completed_jobs;
+-	u32 scheduled_jobs;
++	/*
++	 * Incremented by the job free work, which runs on the system
++	 * workqueue: jobs of one context can be freed on several CPUs at
++	 * once, so a plain u32++ loses increments and the context's fences
++	 * then never signal again (every SYNCPT_WAIT times out).
++	 */
++	atomic_t completed_jobs;
++	u32 scheduled_jobs;	/* under tegra->context_lock */
+ 	unsigned int id;
+ };
+ 

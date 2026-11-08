@@ -1,0 +1,28 @@
+Subject: [PATCH] ARM: dts: tegra30: surface-rt: drop the WLAN wake interrupt
+
+mwifiex requests the PU5 host-wake IRQ as IRQF_TRIGGER_LOW, while the line is active high
+(ACPI: Level, ActiveHigh, PullDown). With the 14.62.17.p215 combo firmware needed for Bluetooth
+the line idles low, so arming it in mwifiex_enable_wake() fires at once, calls pm_system_wakeup()
+and every suspend fails with -EBUSY. Wake-on-WLAN is not used; drop the interrupt.
+
+---
+diff --git a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -551,8 +551,14 @@
+ 			compatible = "marvell,sd8897";
+ 			reg = <1>;
+ 
+-			interrupt-parent = <&gpio>;
+-			interrupts = <TEGRA_GPIO(U, 5) IRQ_TYPE_LEVEL_HIGH>;
++			/*
++			 * No wake interrupt: PU5 is the WLAN host-wake line (ACPI:
++			 * level, active high, pull-down), but mwifiex requests it as
++			 * IRQF_TRIGGER_LOW. With the 14.62.17.p215 combo firmware
++			 * (needed for Bluetooth) the line idles low, so arming it at
++			 * suspend fires at once and aborts every suspend (-EBUSY).
++			 * Wake-on-WLAN is not used; power button and lid still wake.
++			 */
+ 		};
+ 
+ 		// TODO test SDIO bluetooth binding

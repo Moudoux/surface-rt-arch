@@ -1,0 +1,49 @@
+diff --git a/drivers/mmc/host/sdhci-tegra.c b/drivers/mmc/host/sdhci-tegra.c
+index 820ce4dae..b1da35b81 100644
+--- a/drivers/mmc/host/sdhci-tegra.c
++++ b/drivers/mmc/host/sdhci-tegra.c
+@@ -693,6 +693,35 @@ static void tegra_sdhci_parse_pad_autocal_dt(struct sdhci_host *host)
+ 	}
+ }
+ 
++/*
++ * The controller only drives the SD clock while a command or data transfer is
++ * in flight (SPI_MODE_CLKEN_OVERRIDE is cleared in tegra_sdhci_reset()). After
++ * CMD11 the card keeps DAT[3:0] low until it sees the clock at 1.8 V, so the
++ * core's DAT0 check right after the voltage switch (mmc_set_uhs_voltage())
++ * would always see "busy". Force the clock on for 1 ms around that check.
++ */
++static int tegra_sdhci_card_busy(struct mmc_host *mmc)
++{
++	struct sdhci_host *host = mmc_priv(mmc);
++	u32 clk_ctrl = 0, present_state;
++	bool force_clk = mmc->ios.signal_voltage == MMC_SIGNAL_VOLTAGE_180 &&
++			 mmc->ios.timing == MMC_TIMING_LEGACY;
++
++	if (force_clk) {
++		clk_ctrl = sdhci_readl(host, SDHCI_TEGRA_VENDOR_CLOCK_CTRL);
++		sdhci_writel(host, clk_ctrl | SDHCI_CLOCK_CTRL_SPI_MODE_CLKEN_OVERRIDE,
++			     SDHCI_TEGRA_VENDOR_CLOCK_CTRL);
++		usleep_range(1000, 1500);
++	}
++
++	present_state = sdhci_readl(host, SDHCI_PRESENT_STATE);
++
++	if (force_clk)
++		sdhci_writel(host, clk_ctrl, SDHCI_TEGRA_VENDOR_CLOCK_CTRL);
++
++	return !(present_state & SDHCI_DATA_0_LVL_MASK);
++}
++
+ static void tegra_sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ {
+ 	struct sdhci_host *host = mmc_priv(mmc);
+@@ -1684,6 +1713,8 @@ static int sdhci_tegra_probe(struct platform_device *pdev)
+ 	if (soc_data->nvquirks & NVQUIRK_HAS_PADCALIB)
+ 		host->mmc_host_ops.request = tegra_sdhci_request;
+ 
++	host->mmc_host_ops.card_busy = tegra_sdhci_card_busy;
++
+ 	host->mmc_host_ops.hs400_enhanced_strobe =
+ 			tegra_sdhci_hs400_enhanced_strobe;
+ 

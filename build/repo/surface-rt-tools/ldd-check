@@ -1,0 +1,19 @@
+#!/bin/sh
+# pacman PostTransaction hook (surface-rt-ldd.hook): warn (never fail) when a binary or library of our
+# installed [surface] packages has a shared library that cannot be found, e.g. after a soname bump in the
+# repo that our builds have not followed yet.
+# Usage outside the hook: ldd-check [pkgname...]   (default: installed packages that are in [surface])
+# Libraries of optional features (optdepends not installed): plasma-desktop's kimpanel ibus/scim panels and
+# krunner-plugininstaller (PackageKit). Missing on purpose; never reported.
+ignore='libibus-1[.]0[.]so|libscim-1[.]0[.]so|libpackagekitqt6[.]so'
+if [ $# -gt 0 ]; then pkgs=$*; else
+  pkgs=$(pacman -Slq surface 2>/dev/null | while read -r p; do pacman -Qq "$p" 2>/dev/null; done)
+fi
+[ -n "$pkgs" ] || exit 0
+# shellcheck disable=SC2086
+pacman -Qlq $pkgs 2>/dev/null | grep -E '^/usr/(bin|lib|libexec)/' | grep -vE '\.ko(\.[a-z]+)?$|/$' |
+  while read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && echo "$f"; done |
+  xargs -r ldd 2>/dev/null |
+  awk -v ign="$ignore" '/^\// { f=$1; sub(/:$/,"",f); next } /not found/ && $1 !~ ign { print "surface-rt: WARNING " f ": " $1 " not found"; n++ }
+       END { if (n) print "surface-rt: " n " missing libraries: rebuild the package (build/repo/REBUILD.md)" }'
+exit 0

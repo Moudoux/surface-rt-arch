@@ -1,0 +1,42 @@
+# linux-surface-rt: keep the running kernel bootable as the extlinux "fallback" entry
+# (LINUX /boot/zImage.old, FDT /boot/dtbs/tegra30-microsoft-surface-rt.dtb.fallback).
+# The fallback copies are not owned by the package, so pacman never removes them.
+# If the kernel release string changes between builds (CONFIG_LOCALVERSION), the old modules dir is kept
+# too (pacman would otherwise delete it with the old package); one fallback dir is kept at a time.
+
+_relfile=/usr/share/linux-surface-rt/kernelrelease
+_state=/var/lib/linux-surface-rt
+_dtb=/boot/dtbs/tegra30-microsoft-surface-rt.dtb
+
+post_install() {
+  depmod -a "$(cat $_relfile)"
+  echo ">> linux-surface-rt: booting a new kernel needs an APX boot from the PC (boot-apx.sh boot)."
+}
+
+pre_upgrade() {
+  cp -f /boot/zImage /boot/zImage.old
+  cp -f $_dtb $_dtb.fallback
+  mkdir -p $_state
+  old=$(cat $_relfile 2>/dev/null)
+  echo "$old" > $_state/upgrading-from
+  rm -rf "/usr/lib/modules/$old.keep"
+  [ -n "$old" ] && [ -d "/usr/lib/modules/$old" ] && cp -a "/usr/lib/modules/$old" "/usr/lib/modules/$old.keep"
+  echo ">> linux-surface-rt: running kernel saved as zImage.old + $_dtb.fallback (extlinux 'fallback')."
+}
+
+post_upgrade() {
+  new=$(cat $_relfile)
+  old=$(cat $_state/upgrading-from 2>/dev/null); rm -f $_state/upgrading-from
+  if [ -n "$old" ] && [ "$old" != "$new" ] && [ -d "/usr/lib/modules/$old.keep" ]; then
+    prev=$(cat $_state/fallback-release 2>/dev/null)
+    [ -n "$prev" ] && [ "$prev" != "$new" ] && [ "$prev" != "$old" ] && rm -rf "/usr/lib/modules/$prev"
+    rm -rf "/usr/lib/modules/$old"
+    mv "/usr/lib/modules/$old.keep" "/usr/lib/modules/$old"
+    echo "$old" > $_state/fallback-release
+    echo ">> linux-surface-rt: kept /usr/lib/modules/$old for the fallback kernel."
+  else
+    rm -rf "/usr/lib/modules/$old.keep"
+  fi
+  depmod -a "$new"
+  echo ">> linux-surface-rt: booting the new kernel needs an APX boot from the PC (boot-apx.sh boot)."
+}

@@ -1,0 +1,22 @@
+# Surface RT update safety: pacman hooks for the local [surface] repo + surface-repo-add. Build: ../make-repo.sh
+pkgname=surface-rt-tools
+pkgver=1
+pkgrel=3
+pkgdesc="Surface RT: pacman hooks guarding our patched packages, local repo helper, session/SDDM defaults, Bluetooth UART attach"
+arch=(any)
+url="https://github.com/Moudoux/surface-rt-arch"
+license=(MIT)
+depends=(pacman libarchive)
+optdepends=('sddm: graphical login (config in /etc/sddm.conf.d)' 'plasma-keyboard: touch keyboard in SDDM'
+            'python: Bluetooth UART attach (surface-rt-bluetooth.service)' 'bluez: Bluetooth stack')
+backup=(etc/sddm.conf.d/10-surface-rt.conf)
+
+package() {
+  cd "$startdir"
+  install -Dm755 -t "$pkgdir/usr/lib/surface-rt" hold-check ldd-check bt-attach
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/system" surface-rt-bluetooth.service
+  install -Dm755 -t "$pkgdir/usr/bin" surface-repo-add
+  install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" surface-rt-hold.hook surface-rt-ldd.hook surface-rt-keep.hook
+  install -Dm644 50-surface-rt.conf "$pkgdir/usr/lib/environment.d/50-surface-rt.conf"
+  install -Dm644 sddm-surface-rt.conf "$pkgdir/etc/sddm.conf.d/10-surface-rt.conf"
+}

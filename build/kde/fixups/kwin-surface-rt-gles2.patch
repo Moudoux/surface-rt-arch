@@ -1,0 +1,111 @@
+diff --git a/src/opengl/eglcontext.cpp b/src/opengl/eglcontext.cpp
+index b48068c..2bb510a 100644
+--- a/src/opengl/eglcontext.cpp
++++ b/src/opengl/eglcontext.cpp
+@@ -410,12 +410,23 @@ bool EglContext::checkSupported() const
+     const bool supportsUnpack = hasOpenglExtension(QByteArrayLiteral("GL_EXT_unpack_subimage"));
+     const bool supportsBGRADownload = hasOpenglExtension(QByteArrayLiteral("GL_EXT_read_format_bgra"));
+ 
+-    if (!supports3DTextures || !supportsUnpack || !supportsBGRADownload) {
++    if (!supportsUnpack || !supportsBGRADownload) {
+         return false;
+     }
++    // Surface RT (Tegra 3 / grate): 3D textures are only needed for ICC profile LUTs, which fail gracefully without them.
++    if (!supports3DTextures) {
++        qCWarning(KWIN_OPENGL) << "No 3D texture support: ICC profiles will not be available";
++    }
+     // some old hardware only supports very limited shaders. To prevent the shaders KWin uses later on from not working,
+     // test a reasonably complex one here and bail out early if it doesn't work
+-    return m_shaderManager->shader(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace | ShaderTrait::AdjustSaturation | ShaderTrait::Modulate);
++    if (m_shaderManager->shader(ShaderTrait::MapTexture | ShaderTrait::TransformColorspace | ShaderTrait::AdjustSaturation | ShaderTrait::Modulate)) {
++        return true;
++    }
++    // Surface RT (Tegra 3 / grate): the fragment stage has only 32 uniform components, too few for the colour
++    // management shader (3 mat4 + parameters). ShaderManager drops TransformColorspace when it cannot be built,
++    // which is exact for identity colour pipelines (SDR sRGB output). Require the remaining traits to work.
++    qCWarning(KWIN_OPENGL) << "Colour transform shader not supported by this GPU: colour management disabled";
++    return m_shaderManager->shader(ShaderTrait::MapTexture | ShaderTrait::AdjustSaturation | ShaderTrait::Modulate);
+ }
+ 
+ QSet<QByteArray> EglContext::openglExtensions() const
+diff --git a/src/opengl/gllut3D.cpp b/src/opengl/gllut3D.cpp
+index f373e92..2deed6d 100644
+--- a/src/opengl/gllut3D.cpp
++++ b/src/opengl/gllut3D.cpp
+@@ -65,6 +65,11 @@ void GlLookUpTable3D::bind()
+ 
+ std::unique_ptr<GlLookUpTable3D> GlLookUpTable3D::create(const std::function<QVector3D(size_t x, size_t y, size_t z)> &mapping, size_t xSize, size_t ySize, size_t zSize)
+ {
++    // Surface RT (Tegra 3 / grate): no 3D textures on GLES 2.0 without GL_OES_texture_3D; callers handle nullptr.
++    const auto context = EglContext::currentContext();
++    if (!context || !(context->hasVersion(Version(3, 0)) || context->hasOpenglExtension(QByteArrayLiteral("GL_OES_texture_3D")))) {
++        return nullptr;
++    }
+     GLuint handle = 0;
+     glGenTextures(1, &handle);
+     if (!handle) {
+diff --git a/src/opengl/glshadermanager.cpp b/src/opengl/glshadermanager.cpp
+index 4883acd..c4e12e5 100644
+--- a/src/opengl/glshadermanager.cpp
++++ b/src/opengl/glshadermanager.cpp
+@@ -130,6 +130,16 @@ GLShader *ShaderManager::shader(ShaderTraits traits)
+     std::unique_ptr<GLShader> &shader = m_shaderHash[traits];
+     if (!shader) {
+         shader = generateShader(traits);
++        if (!shader && (traits & ShaderTrait::TransformColorspace)) {
++            // Surface RT (Tegra 3 / grate): GPUs with very few fragment uniforms cannot build the colour
++            // transform; fall back to the same shader without it (exact for identity colour pipelines).
++            static bool warned = false;
++            if (!warned) {
++                qCWarning(KWIN_OPENGL) << "Falling back to shaders without TransformColorspace";
++                warned = true;
++            }
++            shader = generateShader(traits & ~ShaderTraits(ShaderTrait::TransformColorspace));
++        }
+     }
+     return shader.get();
+ }
+diff --git a/src/plugins/qpa/window.cpp b/src/plugins/qpa/window.cpp
+index f5cdbf8..94d3bcc 100644
+--- a/src/plugins/qpa/window.cpp
++++ b/src/plugins/qpa/window.cpp
+@@ -22,6 +22,8 @@
+ 
+ #include <logging.h>
+ 
++#include <algorithm>
++
+ #include <libdrm/drm_fourcc.h>
+ #include <qpa/qwindowsysteminterface.h>
+ 
+@@ -60,12 +62,28 @@ Swapchain *Window::swapchain(const std::shared_ptr<EglContext> &context, const F
+             allocator = Compositor::self()->primaryDevice()->allocator();
+         }
+ 
++        // FormatModifierMap is a QHash, so its iteration order changes from run to run.
++        // Some drivers (grate on Tegra 3) can import ABGR8888 for sampling but not render
++        // to it, which makes the internal window's framebuffer incomplete. Try ARGB8888
++        // first, then the rest in a fixed order.
++        QList<uint32_t> candidates;
+         for (auto it = formats.begin(); it != formats.end(); it++) {
+             if (auto info = FormatInfo::get(it.key()); info && info->bitsPerColor == 8 && info->alphaBits == 8) {
++                candidates.push_back(it.key());
++            }
++        }
++        std::sort(candidates.begin(), candidates.end(), [](uint32_t a, uint32_t b) {
++            if ((a == DRM_FORMAT_ARGB8888) != (b == DRM_FORMAT_ARGB8888)) {
++                return a == DRM_FORMAT_ARGB8888;
++            }
++            return a < b;
++        });
++        for (const uint32_t format : std::as_const(candidates)) {
++            {
+                 const auto options = GraphicsBufferOptions{
+                     .size = nativeSize,
+-                    .format = it.key(),
+-                    .modifiers = it.value(),
++                    .format = format,
++                    .modifiers = formats[format],
+                     .software = software,
+                     .scanout = false,
+                 };

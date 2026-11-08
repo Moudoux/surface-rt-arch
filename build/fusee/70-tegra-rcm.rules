@@ -1,0 +1,2 @@
+# NVIDIA Tegra 3 in APX/RCM mode (Surface RT): let the logged-in user access it
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7130", MODE="0660", TAG+="uaccess"

@@ -1,0 +1,31 @@
+# Kernel for the Surface RT (libre-tegra + surface-rt-patches + build/kernel/00*.patch), packaged from an
+# already finished build in build/kernel/out (build/kernel/build.sh). Nothing is compiled here.
+# pkgrel = our kernel build number (build #6 -> 7.0.1-6). Build: build/repo/make-repo.sh
+pkgname=linux-surface-rt
+pkgver=7.0.1
+pkgrel=6
+pkgdesc="Linux kernel for the Microsoft Surface RT (Tegra 3), APX/U-Boot boot"
+arch=(armv7h)
+url="https://github.com/Moudoux/surface-rt-arch"
+license=(GPL-2.0-only)
+depends=(kmod)
+conflicts=(linux-armv7)
+options=(!strip !debug)
+install=linux-surface-rt.install
+backup=()
+
+_out=$(realpath "$startdir/../../kernel/out")
+_dts=$_out/arch/arm/boot/dts/nvidia
+
+package() {
+  local rel; rel=$(cat $_out/include/config/kernel.release)
+  install -Dm644 $_out/arch/arm/boot/zImage "$pkgdir/boot/zImage"
+  install -Dm644 -t "$pkgdir/boot/dtbs" $_dts/tegra30-microsoft-surface-rt.dtb $_dts/tegra30-microsoft-surface-rt-efi.dtb
+  local m="$pkgdir/usr/lib/modules/$rel"
+  mkdir -p "$m"
+  cp -a $_out/staging/lib/modules/$rel/kernel "$m/"
+  # modules_install metadata; the depmod outputs (modules.dep, .alias, ...) are left to depmod in the install script
+  install -m644 -t "$m" $_out/staging/lib/modules/$rel/modules.{order,builtin,builtin.modinfo}
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/linux-surface-rt/kernelrelease" <<<"$rel"
+  # read by linux-surface-rt.install
+}

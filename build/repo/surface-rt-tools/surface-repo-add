@@ -1,0 +1,40 @@
+#!/bin/sh
+# Run as root on the Surface: copy packages (and optionally a new compat file) into the local [surface]
+# repo and rebuild its database from the newest file of each package. One older file per package stays
+# in the directory for rollback (pacman -U /srv/surface-repo/<file>); anything older is removed.
+# Usage: surface-repo-add [path/compat] [pkg.pkg.tar.* ...]      then: pacman -Syu
+set -e
+R=${SRT_REPO:-/srv/surface-repo}
+[ -n "$SRT_REPO" ] || [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+for f in "$@"; do
+  case $f in
+    compat|*/compat) install -m644 "$f" "$R/compat"; echo "compat updated" ;;
+    *.pkg.tar.*) install -m644 "$f" "$R/" ;;
+    *) echo "skipping $f (not a package or compat file)" ;;
+  esac
+done
+cd "$R"
+list=$(for f in *.pkg.tar.*; do
+  [ -e "$f" ] || continue
+  bsdtar -xOf "$f" .PKGINFO | awk -v f="$f" '/^pkgname = /{n=$3} /^pkgver = /{v=$3} END{print n, v, f}'
+done | sort)
+newest=; drop=; prevn=; best=; bestf=; second=; secondf=
+flush() { [ -n "$prevn" ] && newest="$newest $bestf"; return 0; }
+# shellcheck disable=SC2086
+while read -r n v f; do
+  if [ "$n" != "$prevn" ]; then flush; prevn=$n; best=$v; bestf=$f; second=; secondf=; continue; fi
+  if [ "$(vercmp "$v" "$best")" -gt 0 ]; then
+    [ -n "$secondf" ] && drop="$drop $secondf"; second=$best; secondf=$bestf; best=$v; bestf=$f
+  elif [ -z "$second" ] || [ "$(vercmp "$v" "$second")" -gt 0 ]; then
+    [ -n "$secondf" ] && drop="$drop $secondf"; second=$v; secondf=$f
+  else drop="$drop $f"; fi
+done <<EOF
+$list
+EOF
+flush
+for f in $drop; do rm -f "$f"; echo "removed old $f"; done
+# db rebuilt from scratch from the newest file per name, so removed/old entries never linger
+rm -f surface.db surface.db.tar.gz surface.db.tar.gz.old surface.files surface.files.tar.gz surface.files.tar.gz.old
+# shellcheck disable=SC2086
+repo-add -q surface.db.tar.gz $newest
+echo "[surface] now:"; echo "$list" | while read -r n v f; do case " $newest " in *" $f "*) echo "  $n $v";; esac; done

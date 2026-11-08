@@ -1,0 +1,18 @@
+[Unit]
+Description=Surface RT Bluetooth UART attach (Marvell 88W8797, ttyTHS1, H4 3M)
+Documentation=file:///usr/lib/surface-rt/bt-attach
+# Needs the 14.62.17.p215 combo firmware (not packaged; see surface-rt-patches README).
+ConditionPathExists=/usr/lib/firmware/updates/mrvl/sd8797_uapsta.bin
+# mlan0 appears once mwifiex has downloaded the combo firmware, which also starts the BT core.
+Wants=sys-subsystem-net-devices-mlan0.device
+After=sys-subsystem-net-devices-mlan0.device dev-ttyTHS1.device
+Before=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/lib/surface-rt/bt-attach
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

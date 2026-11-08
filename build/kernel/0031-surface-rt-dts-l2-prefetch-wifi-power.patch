@@ -1,0 +1,28 @@
+diff --git a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+index 290bb87a7..e9efb1aff 100644
+--- a/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
++++ b/arch/arm/boot/dts/nvidia/tegra30-microsoft-surface-rt.dts
+@@ -121,7 +121,6 @@ backlight-pwm {
+ 
+ 			wifi-power {
+ 				nvidia,pins = "sdmmc3_dat7_pd4";
+-				nvidia,function = "rsvd1";
+ 				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
+ 				nvidia,tristate = <TEGRA_PIN_DISABLE>;
+ 				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
+@@ -1899,3 +1898,15 @@ timing-750000000 {
+ 		};
+ 	};
+ };
++
++/*
++ * The Windows firmware leaves the PL310 prefetch control register at 0 and
++ * the kernel writes that saved value back after AUX_CTRL, which turns the
++ * L2 prefetchers off. Use NVIDIA's Tegra 3 setting (downstream
++ * tegra_init_cache: PREFETCH_CTRL = 7, AUX D+I prefetch).
++ */
++&{/cache-controller@50043000} {
++	prefetch-data = <1>;
++	prefetch-instr = <1>;
++	arm,prefetch-offset = <7>;
++};

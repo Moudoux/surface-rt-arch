@@ -1,0 +1,39 @@
+#!/bin/sh
+# pacman PreTransaction hook (surface-rt-hold.hook), AbortOnFail. Targets arrive on stdin.
+# 1. Refuses to upgrade Qt / KDE Frameworks / Plasma to a version our patched packages in [surface] were
+#    not built for (kwin and kirigami use Qt private API; kwin/plasma-desktop must match the Plasma release).
+#    The allowed versions are in /srv/surface-repo/compat ("name=pkgver" lines, pkgrel ignored).
+# 2. Refuses transactions that would swap our mesa-grate / linux-surface-rt for repo mesa / linux-armv7.
+# Testing without root: SRT_COMPAT=<file> SRT_DBDIR=<dir with core.db ...> hold-check < targets
+compat=${SRT_COMPAT:-/srv/surface-repo/compat}
+dbdir=${SRT_DBDIR:-$(pacman-conf DBPath)sync}
+repos=$(pacman-conf --repo-list)
+fail=0
+say() { echo "surface-rt: $*"; }
+[ -r "$compat" ] || { say "$compat is missing: refusing (see build/repo/REBUILD.md)"; exit 1; }
+while read -r t; do
+  case $t in
+    mesa|mesa-libgl|linux-armv7|linux-armv7-headers)
+      say "'$t' would replace our mesa-grate / linux-surface-rt. Refusing."; fail=1; continue ;;
+  esac
+  want=$(sed -n "s/^$t=//p" "$compat")
+  [ -n "$want" ] || continue
+  new=
+  for r in $repos; do
+    [ -r "$dbdir/$r.db" ] || continue
+    new=$(bsdtar -tf "$dbdir/$r.db" | sed -n "s|^$t-\([^/-]*\)-[^/-]*/\$|\1|p" | head -n1)
+    [ -n "$new" ] && break
+  done
+  if [ -z "$new" ]; then
+    say "$t: version not found in the sync dbs (pacman -U?); allowing."
+  elif [ "$new" != "$want" ]; then
+    say "$t $new: our [surface] packages are built for $t $want."
+    fail=1
+  fi
+done
+if [ $fail = 1 ]; then
+  say "Upgrade blocked, nothing was changed. Rebuild our packages for the new versions first"
+  say "(build/repo/REBUILD.md on the PC), add them with surface-repo-add, then run pacman -Syu again."
+  exit 1
+fi
+exit 0

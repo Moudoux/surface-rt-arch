@@ -1,0 +1,21 @@
+# Block Qt / KDE Frameworks / Plasma upgrades our [surface] packages are not built for, and swaps of
+# mesa-grate / linux-surface-rt for repo mesa / linux-armv7. See /usr/lib/surface-rt/hold-check.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = qt6-base
+Target = qt6-declarative
+Target = kcoreaddons
+Target = plasma-workspace
+Target = mesa
+Target = mesa-libgl
+Target = linux-armv7
+Target = linux-armv7-headers
+
+[Action]
+Description = Surface RT: checking that our patched packages fit this upgrade...
+When = PreTransaction
+Exec = /usr/lib/surface-rt/hold-check
+NeedsTargets
+AbortOnFail

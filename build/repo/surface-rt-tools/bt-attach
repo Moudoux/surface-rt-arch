@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Surface RT: attach the Marvell 88W8797 Bluetooth UART (ttyTHS1) as an H4 HCI device and stay running.
+
+The combo firmware (14.62.17.p215, loaded over SDIO by mwifiex) brings Bluetooth up on UARTC at 3 Mbaud
+with RTS/CTS. The first exchange after opening the port is unreliable (stale bytes from an earlier reply),
+and hci_uart gives up after one HCI Reset, so plain btattach fails. We therefore answer one HCI Reset
+ourselves, drain the line, and only then hand the port to the kernel (N_HCI, H4). If 3M gets no answer,
+do what the Windows driver does: HCI Reset at 115200, then vendor command 0xfc09 to switch to 3M.
+Exit status != 0 lets systemd retry. SIGTERM closes the port, which removes hci0."""
+import fcntl, os, select, signal, struct, sys, termios, time
+
+TTY = "/dev/ttyTHS1"
+FAST, SLOW = 3000000, 115200
+N_HCI = 15
+HCIUARTSETPROTO, HCIUARTSETFLAGS = 0x400455c8, 0x400455cb   # _IOW('U', 200 / 203, int)
+HCI_UART_H4, HCI_UART_RESET_ON_INIT = 0, 1
+RESET = b"\x01\x03\x0c\x00"
+RESET_OK = b"\x04\x0e\x04\x01\x03\x0c\x00"            # Command Complete, Reset, status 0
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def setup(fd, baud):
+    a = termios.tcgetattr(fd)
+    a[0] = a[1] = a[3] = 0
+    a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | termios.CRTSCTS
+    a[4] = a[5] = baud               # Python >= 3.14: B-constants are the plain rates
+    a[6][termios.VMIN] = 0
+    a[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+
+
+def read_for(fd, seconds):
+    rx, end = b"", time.monotonic() + seconds
+    while time.monotonic() < end:
+        if select.select([fd], [], [], 0.05)[0]:
+            rx += os.read(fd, 512)
+    return rx
+
+
+def command(fd, pkt, want, seconds=1.0):
+    termios.tcflush(fd, termios.TCIFLUSH)
+    os.write(fd, pkt)
+    rx = read_for(fd, seconds)
+    return want in rx, rx
+
+
+def warm_up(fd):
+    for attempt in range(1, 4):
+        setup(fd, FAST)
+        ok, rx = command(fd, RESET, RESET_OK)
+        log(f"reset at {FAST} (try {attempt}): {rx.hex() or '-'}")
+        if ok:
+            return True
+    setup(fd, SLOW)
+    for attempt in range(1, 3):
+        ok, rx = command(fd, RESET, RESET_OK)
+        log(f"reset at {SLOW} (try {attempt}): {rx.hex() or '-'}")
+        if ok:
+            ok, rx = command(fd, b"\x01\x09\xfc\x04" + struct.pack("<I", FAST),
+                             b"\x04\x0e\x04\x01\x09\xfc\x00")
+            log(f"0xfc09 set baud {FAST}: {rx.hex() or '-'}")
+            if not ok:
+                return False
+            time.sleep(0.05)
+            setup(fd, FAST)
+            ok, rx = command(fd, RESET, RESET_OK)
+            log(f"reset at {FAST} after switch: {rx.hex() or '-'}")
+            return ok
+    return False
+
+
+def main():
+    fd = os.open(TTY, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    if not warm_up(fd):
+        log("no HCI answer from the controller")
+        return 1
+    stale = read_for(fd, 0.2)
+    if stale:
+        log(f"drained {stale.hex()}")
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+    fcntl.ioctl(fd, termios.TIOCSETD, struct.pack("i", N_HCI))
+    fcntl.ioctl(fd, HCIUARTSETFLAGS, 1 << HCI_UART_RESET_ON_INIT)
+    fcntl.ioctl(fd, HCIUARTSETPROTO, HCI_UART_H4)
+    log(f"attached {TTY} as H4 at {FAST} baud")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        signal.pause()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

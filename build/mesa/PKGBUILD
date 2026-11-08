@@ -1,0 +1,43 @@
+# Mesa with the grate (Tegra 2/3 GR3D) Gallium driver + Surface RT patches 0001-0019.
+pkgname=mesa-grate
+pkgver=26.2.3
+pkgrel=25
+pkgdesc="Mesa with the open-source grate driver for NVIDIA Tegra 3 (Surface RT)"
+arch=(armv7h)
+url="https://codeberg.org/libre-tegra/mesa"
+license=(MIT)
+depends=(libdrm libglvnd libelf libx11 libxext libxfixes libxshmfence libxxf86vm libxrandr
+         wayland zstd expat llvm-libs lm_sensors libunwind)
+makedepends=(meson ninja python-mako python-packaging python-yaml python-pycparser glslang
+             wayland-protocols libxrandr xorgproto llvm elfutils)
+provides=("mesa=1:$pkgver" mesa-libgl opengl-driver)
+conflicts=(mesa mesa-libgl)
+replaces=()
+options=(!lto !debug)
+source=()
+
+build() {
+  # Incremental: the tree in $srcdir/build persists (build.sh mounts build/mesa/work at /tmp/b).
+  # Delete build/mesa/work to force a clean configure.
+  [ -f build/build.ninja ] || meson setup /src/mesa build --prefix=/usr --libexecdir=lib --sbindir=bin --buildtype=plain --wrap-mode=nodownload -D b_pie=true -D b_lto=false \
+    -D b_ndebug=true \
+    -D platforms=x11,wayland \
+    -D gallium-drivers=grate,softpipe,llvmpipe \
+    -D vulkan-drivers= \
+    -D egl=enabled -D gbm=enabled -D gles1=enabled -D gles2=enabled -D glx=dri \
+    -D glvnd=enabled \
+    -D llvm=enabled -D shared-llvm=enabled \
+    -D gallium-va=disabled \
+    -D video-codecs= \
+    -D valgrind=disabled -D libunwind=enabled \
+    -D microsoft-clc=disabled \
+    -D gallium-rusticl=false -D tools=
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  # libglvnd owns the generic GL/EGL/GLES libraries
+  rm -f "$pkgdir"/usr/lib/lib{GL,GLESv1_CM,GLESv2,EGL}.so*
+  install -Dm644 /src/mesa/docs/license.rst "$pkgdir/usr/share/licenses/$pkgname/license.rst"
+}

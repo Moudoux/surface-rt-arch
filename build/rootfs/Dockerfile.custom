@@ -1,0 +1,3 @@
+FROM srt-alarm-base:latest
+COPY customize.sh /tmp/customize.sh
+RUN /tmp/customize.sh && rm /tmp/customize.sh

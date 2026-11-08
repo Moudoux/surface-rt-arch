@@ -1,0 +1,13 @@
+# Refuse to remove our kernel or Mesa: removing linux-surface-rt deletes /boot/zImage (no boot), removing
+# mesa-grate leaves Plasma without GL. To really remove one: ln -s /dev/null /etc/pacman.d/hooks/surface-rt-keep.hook
+[Trigger]
+Operation = Remove
+Type = Package
+Target = linux-surface-rt
+Target = mesa-grate
+
+[Action]
+Description = Surface RT: refusing to remove the kernel / mesa-grate...
+When = PreTransaction
+Exec = /bin/sh -c 'echo "surface-rt: removing linux-surface-rt or mesa-grate breaks booting or Plasma. Refusing (see the hook file to override)."; exit 1'
+AbortOnFail

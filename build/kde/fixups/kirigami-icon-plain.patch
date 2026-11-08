@@ -1,0 +1,59 @@
+diff --git a/src/primitives/icon.cpp b/src/primitives/icon.cpp
+index fc5308b..f229b4e 100644
+--- a/src/primitives/icon.cpp
++++ b/src/primitives/icon.cpp
+@@ -209,6 +209,9 @@ QSGNode *Icon::updatePaintNode(QSGNode *node, QQuickItem::UpdatePaintNodeData *
+     }
+     if (shouldBeAnimated) {
+         shaderName += u"mix"_s;
++    } else if (!m_active && isEnabled()) {
++        // highlight_amount and desaturate_amount are 0: no effects needed
++        shaderName += u"plain"_s;
+     } else {
+         shaderName += u"default"_s;
+     }
+diff --git a/src/primitives/shaders.cmake b/src/primitives/shaders.cmake
+index d395b2d..26cbb92 100644
+--- a/src/primitives/shaders.cmake
++++ b/src/primitives/shaders.cmake
+@@ -73,6 +73,21 @@ add_shaders("icon_default"
+     INPUT icon
+ )
+ 
++# Icons at rest (not active, enabled): highlight_amount and desaturate_amount
++# are 0, the effects are an identity; skipping them avoids three pow() per
++# pixel (expensive on GPUs with slow transcendentals).
++add_shaders("icon_plain"
++    INPUT icon
++    DEFINES DISABLE_EFFECTS=1
++)
++
++add_shaders("icon_mask_plain"
++    INPUT icon
++    DEFINES
++        ENABLE_MASK=1
++        DISABLE_EFFECTS=1
++)
++
+ add_shaders("icon_mix"
+     INPUT icon
+     DEFINES ENABLE_MIX=1
+diff --git a/src/primitives/shaders/icon.frag b/src/primitives/shaders/icon.frag
+index 5675a45..cce4cd7 100644
+--- a/src/primitives/shaders/icon.frag
++++ b/src/primitives/shaders/icon.frag
+@@ -38,12 +38,14 @@ mediump vec4 texture_color(sampler2D texture_source, mediump vec2 uv)
+     color = vec4(uniforms.mask_color.xyz * color.a, color.a);
+ #endif
+ 
++#ifndef DISABLE_EFFECTS
+     // Highlight effect
+     const mediump float gamma = 1.0 / (2.0 * max(0.25, uniforms.highlight_amount * color.a) + 0.5);
+     color.rgb = pow(color.rgb, vec3(gamma));
+ 
+     // Desaturate effect
+     color = mix(color, vec4(vec3(dot(color.rgb, vec3(0.2126, 0.7152, 0.0722))) * desaturate_opacity, color.a * desaturate_opacity), uniforms.desaturate_amount);
++#endif
+ 
+     return color;
+ }

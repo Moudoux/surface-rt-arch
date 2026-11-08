@@ -1,0 +1,7 @@
+# Versions (pkgver, pkgrel ignored) our [surface] packages are built against. The surface-rt-hold pacman
+# hook refuses upgrades to any other version. Bump only after rebuilding (REBUILD.md); ship with
+# surface-repo-add <this file> <packages>.
+qt6-base=6.12.0
+qt6-declarative=6.12.0
+kcoreaddons=6.31.0
+plasma-workspace=6.8.2

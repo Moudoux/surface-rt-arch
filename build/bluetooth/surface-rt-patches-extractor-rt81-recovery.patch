@@ -1,0 +1,45 @@
+diff --git a/README.md b/README.md
+index 3275986..10ba25a 100644
+--- a/README.md
++++ b/README.md
+@@ -66,7 +66,11 @@ cuts it out of the driver you already have:
+ 
+ - Input: `mwls97w8arm.sys` from the Windows RT 8.1 IR5 driver package
+   (`Devices/Nvidia/SurfaceRT/Install/mwls97w8arm.inf_arm_*`), SHA256
+-  `ac47a0927099cffac55d51dbc91da32f848481f04987a8de5027548245a87fde`. Other versions are refused.
++  `ac47a0927099cffac55d51dbc91da32f848481f04987a8de5027548245a87fde`, or the same file from the
++  Windows RT 8.1 (6.3.9600.16384) Surface RT recovery image (`sources/install.wim`,
++  `Windows/System32/Drivers/mwls97w8arm.sys`, DriverVer 14.62.17215.91), SHA256
++  `a586b6e85f1125c9c22fad303a73deed7c24cdc30359121cef15b1a54d0f86a3`. Both hold the identical image
++  at the same RVA. Other versions are refused.
+ - Output: 434264 bytes (RVA `0xb2830`, size `0x6a058`), SHA256
+   `97cc4df3d978db1485c3531c13749cc91d12eae7570c38edeabfd2dd9e6d8b74`, identity string
+   `$Id: w8797-B0, RF878X, FP62_WIN7, 14.62.17.p215, BT_UART $`. The script verifies all of this and
+diff --git a/tools/bluetooth/extract-windows-uart-firmware.py b/tools/bluetooth/extract-windows-uart-firmware.py
+index 8bbc276..1a4089d 100644
+--- a/tools/bluetooth/extract-windows-uart-firmware.py
++++ b/tools/bluetooth/extract-windows-uart-firmware.py
+@@ -7,7 +7,13 @@ from pathlib import Path
+ import struct
+ 
+ 
+-SOURCE_SHA256 = "ac47a0927099cffac55d51dbc91da32f848481f04987a8de5027548245a87fde"
++# Accepted driver builds; both carry the identical BT_UART image at IMAGE_RVA.
++SOURCE_SHA256 = {
++    # Windows RT 8.1 IR5 driver package
++    "ac47a0927099cffac55d51dbc91da32f848481f04987a8de5027548245a87fde",
++    # Windows RT 8.1 (6.3.9600.16384) Surface RT recovery image, DriverVer 14.62.17215.91
++    "a586b6e85f1125c9c22fad303a73deed7c24cdc30359121cef15b1a54d0f86a3",
++}
+ IMAGE_SHA256 = "97cc4df3d978db1485c3531c13749cc91d12eae7570c38edeabfd2dd9e6d8b74"
+ IMAGE_RVA = 0xB2830
+ IMAGE_SIZE = 0x6A058
+@@ -16,7 +22,7 @@ TAG = b"$Id: w8797-B0, RF878X, FP62_WIN7, 14.62.17.p215, BT_UART $"
+ 
+ def extract(source: Path) -> bytes:
+     data = source.read_bytes()
+-    if hashlib.sha256(data).hexdigest() != SOURCE_SHA256:
++    if hashlib.sha256(data).hexdigest() not in SOURCE_SHA256:
+         raise ValueError("Source hash differs from the analysed Surface RT driver")
+     pe = struct.unpack_from("<I", data, 0x3C)[0]
+     if data[:2] != b"MZ" or data[pe:pe + 4] != b"PE\0\0":

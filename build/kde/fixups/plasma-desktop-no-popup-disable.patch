@@ -1,0 +1,19 @@
+diff --git a/desktoppackage/contents/applet/CompactApplet.qml b/desktoppackage/contents/applet/CompactApplet.qml
+index 1aba2a5..18a94b9 100644
+--- a/desktoppackage/contents/applet/CompactApplet.qml
++++ b/desktoppackage/contents/applet/CompactApplet.qml
+@@ -240,10 +240,10 @@ PlasmaCore.ToolTipArea {
+             focus: true
+ 
+ 
+-            // Workaround for QTBUG-146992
+-            // https://qt-project.atlassian.net/browse/QTBUG-146992
+-            // https://codereview.qt-project.org/c/qt/qtbase/+/738776
+-            enabled: dialog.visible
++            // Surface RT: upstream's QTBUG-146992 workaround (enabled: dialog.visible, KDE bug 515280)
++            // dropped. Toggling enabled on the whole popup tree makes every item re-sync its theme
++            // colours: ~0.5 s of plasmashell CPU per launcher open+close on Tegra 3. Cost: shortcuts
++            // such as Ctrl+F inside applet popups can clash with those of hidden applet popups.
+             
+             Keys.onEscapePressed: {
+                 root.plasmoidItem.expanded = false;

@@ -1,0 +1,36 @@
+# upstream trees (./fetch-sources.sh)
+/sources/
+# build outputs, caches, downloads
+/build/kernel/out/
+/build/u-boot/out/
+/build/rootfs/out/
+/build/rootfs/dl/
+/build/mesa/pkg/
+/build/mesa/work/
+/build/kde/pkg/
+/build/kde/work/
+/build/kde/logs/
+/build/kde/ccache/
+/build/kde/srcdest/
+/build/repo/surface/
+/build/repo/.cache/
+/build/repo/*/src/
+/build/repo/*/pkg/
+/build/fusee/venv/
+/build/fusee/payloads/
+/build/fusee/u-boot-dtb-tegra.bin
+# device-specific: dumped from YOUR Surface by boot-apx.sh bct; never share it
+/build/fusee/surface-rt.bct
+# test binaries (built on the device or in the KDE image)
+/build/gltest/fbotest
+/build/gltest/fillbench
+/build/gltest/gltest
+/build/gltest/shadercheck
+/build/perf/wcbench
+/build/perf/qmlprof/traces/
+*.log
+*.img
+*.pkg.tar.*
+# non-redistributable firmware
+sd8797_uapsta.bin
+*.sys

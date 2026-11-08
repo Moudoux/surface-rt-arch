@@ -1,0 +1,11 @@
+# Upgrades/removals only (~15 s on the Tegra). Warn when our [surface] packages miss a shared library after a transaction. Never fails.
+[Trigger]
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Surface RT: checking libraries of our patched packages...
+When = PostTransaction
+Exec = /usr/lib/surface-rt/ldd-check

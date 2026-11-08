@@ -1,0 +1,80 @@
+diff --git a/drivers/gpu/drm/grate/gr3d.c b/drivers/gpu/drm/grate/gr3d.c
+index d422f9d61..08c9635c3 100644
+--- a/drivers/gpu/drm/grate/gr3d.c
++++ b/drivers/gpu/drm/grate/gr3d.c
+@@ -148,10 +148,15 @@ static int gr3d_init(struct host1x_client *client)
+ 		goto bo_free;
+ 	}
+ 
++	/*
++	 * Job timeout is 2000 / 2 = 1 s (was 300 ms): one full-screen draw
++	 * with a long fragment shader takes ~60 ms at 1366x768, so a job of
++	 * a few such draws exceeded 300 ms and got the GPU reset.
++	 */
+ 	gr3d->channel = tegra_drm_open_channel(tegra_drm, drm_client,
+ 					       /*TEGRA_DRM_PIPE_2D |*/
+ 					       TEGRA_DRM_PIPE_3D,
+-					       128, 3, 0, 600, "3d channel");
++					       128, 3, 0, 2000, "3d channel");
+ 	if (IS_ERR(gr3d->channel)) {
+ 		err = PTR_ERR(gr3d->channel);
+ 		dev_err(client->dev, "failed to open channel: %d\n", err);
+diff --git a/drivers/gpu/drm/grate/uapi/scheduler.c b/drivers/gpu/drm/grate/uapi/scheduler.c
+index 3887786cb..bc91e3c82 100644
+--- a/drivers/gpu/drm/grate/uapi/scheduler.c
++++ b/drivers/gpu/drm/grate/uapi/scheduler.c
+@@ -184,6 +184,46 @@ static inline void tegra_drm_recover_hardware(struct tegra_drm_job *drm_job)
+ 	drm_job->hw_fence = NULL;
+ }
+ 
++/*
++ * The channel reset (DMAGET = DMAPUT) dropped the commands of every job
++ * still in the channel's push buffer, so their hardware fences will never
++ * signal. drm_sched_stop() already removed the scheduler's callbacks and
++ * dropped s_fence->parent; drop the rest of each job's hardware state here
++ * so that drm_sched_resubmit_jobs() -> run_job() submits it afresh with a
++ * new fence.
++ *
++ * Previously run_job() re-used job->hw_fence: that added job->cb to a fence
++ * it was still on, pushed the job into the push buffer a second time and
++ * returned the fence without a new reference, while drm_sched_resubmit_jobs()
++ * drops one ("refcount_t: underflow" in drm_sched_fence_release_scheduled).
++ * Jobs cancelled instead of resubmitted (the guilty context's) kept their
++ * fence attached to the sync point, which warned in host1x_soc_syncpt_release
++ * when the job was freed.
++ */
++static void tegra_drm_sched_cancel_hw_jobs(struct drm_gpu_scheduler *sched)
++{
++	struct drm_sched_job *sched_job;
++
++	drm_sched_for_each_pending_job(sched_job, sched, NULL) {
++		struct tegra_drm_job *job = to_tegra_drm_job(sched_job);
++		struct host1x_channel *channel = job->drm_channel->channel;
++		struct host1x_syncpt *syncpt = job->base.syncpt;
++
++		if (!job->hw_fence)
++			continue;
++
++		/* the fence is not signalled again, nobody else waits on it */
++		host1x_syncpt_detach_fences(syncpt);
++		host1x_syncpt_reset(syncpt, -ECANCELED);
++
++		/* removes job->cb if still there, pops its push buffer words */
++		host1x_channel_cleanup_job(channel, &job->base, job->hw_fence);
++
++		dma_fence_put(job->hw_fence);
++		job->hw_fence = NULL;
++	}
++}
++
+ static enum drm_gpu_sched_stat
+ tegra_drm_sched_timedout_job(struct drm_sched_job *sched_job)
+ {
+@@ -215,6 +255,7 @@ tegra_drm_sched_timedout_job(struct drm_sched_job *sched_job)
+ 
+ 	tegra_drm_debug_dump_hung_job(job);
+ 	tegra_drm_recover_hardware(job);
++	tegra_drm_sched_cancel_hw_jobs(sched);
+ 
+ 	drm_sched_increase_karma(sched_job);
+ 	drm_sched_resubmit_jobs(sched);
