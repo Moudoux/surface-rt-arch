@@ -1,0 +1,6 @@
+#!/bin/sh
+# C compiler / linker driver for armv7h (ALARM) using host clang + lld and build/shell/sysroot.
+SYSROOT="$(cd "$(dirname "$0")" && pwd)/sysroot"
+GCCDIR=$(ls -d "$SYSROOT"/usr/lib/gcc/armv7l-unknown-linux-gnueabihf/* | tail -1)
+exec clang --target=armv7-unknown-linux-gnueabihf -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard \
+  --sysroot="$SYSROOT" --gcc-install-dir="$GCCDIR" -fuse-ld=lld -Wno-unused-command-line-argument "$@"

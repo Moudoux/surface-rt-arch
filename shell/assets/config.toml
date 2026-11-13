@@ -1,0 +1,92 @@
+# rtshell configuration. Defaults live here (built into the binary); ~/.config/rtshell/config.toml is merged
+# over them, so it only needs the keys it changes. The Settings app edits that file; theme, accent and
+# wallpaper apply at once, [keyboard], [input], [idle] and [apps] when Settings changes them.
+
+# Shell style: "rt" = Start screen of tiles + All apps (Windows RT layout), "none" = no shell UI (apps only).
+style = "rt"
+
+# Built-in theme name ("dark", "light") or a path to a theme TOML file (see assets/themes/dark.toml).
+theme = "dark"
+
+# Accent colour ("#rrggbb") over the theme's `colors.accent`; empty = the theme's own. Set by Settings.
+accent = ""
+
+# Wallpaper image (PNG or JPEG, scaled to cover the screen; cached in ~/.cache/rtshell). Empty = a gradient
+# from the theme's colours.
+wallpaper = ""
+
+# The lock screen's image (same format); empty = the wallpaper above. Set by Settings.
+lock_wallpaper = ""
+
+[keyboard]
+# xkb names, as in `localectl list-x11-keymap-layouts`. layout = "" follows the system setting
+# (`localectl set-x11-keymap`: /etc/X11/xorg.conf.d/00-keyboard.conf, else /etc/vconsole.conf), and the
+# on-screen keyboard uses the same layout when it has one for it (us, se, fi; others fall back to us).
+rules = ""
+model = ""
+layout = ""
+variant = ""
+options = ""
+repeat_delay = 400   # ms
+repeat_rate = 25     # keys per second
+
+[osk]
+# On-screen keyboard (shown when a text field gets focus and no hardware keyboard is attached).
+enabled = true
+resize_apps = true       # apps shrink to stay above it (fullscreen apps are overlaid instead)
+
+[lock]
+# Lock screen (Super+L, the Control Center, before sleep, lid closed). Unlocks with the account password,
+# checked by PAM.
+entry = "password"       # "password" (text box) or "pin" (digit pad; only for a numeric password)
+pam_service = "login"    # /etc/pam.d/<name>
+
+[greeter]
+# `rtshell --greeter`, the login screen under greetd (reads /etc/rtshell/config.toml, not this user file).
+default_user = ""        # login name picked at start; empty = the first (lowest uid)
+session = ["rtshell-session"]
+env = ["XDG_SESSION_TYPE=wayland", "XDG_SESSION_DESKTOP=rtshell", "XDG_CURRENT_DESKTOP=rtshell"]
+
+[idle]
+# Without input the screen dims, then blanks (output off), then the system sleeps. Seconds; 0 = never.
+# Any input wakes it; the touch or key that wakes a blank screen is not passed on. Apps can hold it off
+# while they are shown (idle-inhibit, e.g. a video player).
+battery = { dim = 60, blank = 90, sleep = 300 }
+ac = { dim = 270, blank = 300, sleep = 1800 }
+dim_level = 0.3          # dimmed brightness, as a fraction of the brightness before
+lock = true              # lock the session when the screen blanks
+lock_blank = 20          # the lock screen blanks after this many seconds without input
+
+[input]
+tap_to_click = true      # Type Cover trackpad
+natural_scroll = false
+pointer_accel = 0.0      # -1.0 .. 1.0
+# Touchscreen edge gestures (swipe up from the bottom = Home, from the left = previous app, pull down from
+# the top = close): only touches that start within edge_zone px of an edge are claimed; they become a
+# gesture after edge_lock px of inward travel (before that, taps at the edge still reach the app).
+edge_zone = 16.0
+edge_lock = 10.0
+
+[apps]
+xwayland = true          # X11 apps through Xwayland (started 2 s after login; /usr/bin/Xwayland)
+# Super+Return
+terminal = ["foot"]
+# Super+1 .. Super+9 (temporary launcher until Home exists, DESKTOP-SHELL.md Phase 1)
+launch = [
+  ["foot"],
+  ["codium"],
+  ["firefox"],
+]
+# Started once the compositor is up.
+autostart = []
+
+# Extra environment for apps started by the shell (WAYLAND_DISPLAY and XDG_SESSION_TYPE are always set).
+[env]
+QT_QPA_PLATFORM = "wayland"
+GDK_BACKEND = "wayland"
+MOZ_ENABLE_WAYLAND = "1"
+SDL_VIDEODRIVER = "wayland"
+_JAVA_AWT_WM_NONREPARENTING = "1"
+# Qt Quick's distance-field glyph shader exceeds grate's fragment program limit (text invisible);
+# native glyph textures render fine (DESKTOP-SHELL.md Log 2026-11-10).
+QML_DISABLE_DISTANCEFIELD = "1"

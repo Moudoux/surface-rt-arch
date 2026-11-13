@@ -9,6 +9,8 @@
  * Uniforms available to the fragment shader (if declared):
  *   uniform vec4 u_a = (0.5, 0.25, 0.75, 1.0), u_b = (2.0, 0.5, 4.0, 0.125);
  *   uniform sampler2D u_tex: 4x4 texture, texel (i,j) = (i/3, j/3, 0.5, 1).
+ * Other uniforms: "//! uniform NAME values..." lines in the shader; "//! filter linear"
+ * samples u_tex (or any sampler: unit 0) bilinearly.
  * GLTEST_BLEND=1: clear to (0.2, 0.4, 0.6, 0.8), draw with premultiplied
  * source-over blending (GL_ONE, GL_ONE_MINUS_SRC_ALPHA).
  * GLTEST_BLEND="src dst [srcA dstA [eq [eqA]]]": same background, these
@@ -165,6 +167,55 @@ int main(int argc, char **argv)
    if ((loc = glGetUniformLocation(prog, "u_a")) >= 0) glUniform4f(loc, 0.5, 0.25, 0.75, 1.0);
    if ((loc = glGetUniformLocation(prog, "u_b")) >= 0) glUniform4f(loc, 2.0, 0.5, 4.0, 0.125);
    if ((loc = glGetUniformLocation(prog, "u_tex")) >= 0) glUniform1i(loc, 0);
+   /* Directives in the fragment shader source:
+    *   //! uniform NAME v0 v1 ...   float/vec/mat3 uniform or array (missing values 0)
+    *   //! filter linear            bilinear filtering of the sampled texture */
+   {
+      const char *src = slurp(argv[1]);
+      if (strstr(src, "//! filter linear")) {
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      }
+      for (const char *p = src; (p = strstr(p, "//! uniform ")); ) {
+         char name[128];
+         int used = 0;
+         p += 12;
+         if (sscanf(p, "%127s%n", name, &used) != 1) break;
+         p += used;
+         static float v[256];
+         int n = 0;
+         memset(v, 0, sizeof(v));
+         while (n < 256) {
+            char *end;
+            while (*p == ' ') p++;
+            if (*p == '\n' || !*p) break;
+            float f = strtof(p, &end);
+            if (end == p) break;
+            v[n++] = f;
+            p = end;
+         }
+         GLint count = 0;
+         glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+         for (GLint u = 0; u < count; u++) {
+            char un[160];
+            GLint size;
+            GLenum type;
+            glGetActiveUniform(prog, u, sizeof(un), NULL, &size, &type, un);
+            char *br = strchr(un, '[');
+            if (br) *br = 0;
+            if (strcmp(un, name)) continue;
+            loc = glGetUniformLocation(prog, name);
+            switch (type) {
+            case GL_FLOAT:      glUniform1fv(loc, size, v); break;
+            case GL_FLOAT_VEC2: glUniform2fv(loc, size, v); break;
+            case GL_FLOAT_VEC3: glUniform3fv(loc, size, v); break;
+            case GL_FLOAT_VEC4: glUniform4fv(loc, size, v); break;
+            case GL_FLOAT_MAT3: glUniformMatrix3fv(loc, size, GL_FALSE, v); break;
+            default: fprintf(stderr, "directive: unsupported type of %s\n", name); break;
+            }
+         }
+      }
+   }
 
    static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);

@@ -122,7 +122,7 @@ it, and the default is `alarm@surface-rt`.
 ## 7. mesa-grate and the KDE packages (PC)
 
 ```sh
-build/mesa/build.sh        # ~15 min -> build/mesa/pkg/mesa-grate-26.2.3-25-armv7h.pkg.tar.xz
+build/mesa/build.sh        # ~15 min -> build/mesa/pkg/mesa-grate-26.2.3-34-armv7h.pkg.tar.xz
 build/kde/build.sh purpose kirigami kwin plasma-nm plasma-desktop spectacle plasma-welcome \
                    plasma-mobile discover plasma-browser-integration flatpak-kcm
 ```

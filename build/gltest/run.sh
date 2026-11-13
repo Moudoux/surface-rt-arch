@@ -11,7 +11,7 @@
 # -B  blend spec for GLTEST_BLEND (e.g. "cc isc" or "ca one sa isa add"),
 #     see gltest.c; GLTEST_BLEND_COLOR / GLTEST_COLORMASK pass through too
 # -v  vertex shader file (GLTEST_VS) for every test, both runs
-# GLTEST_SCISSOR="x y w h" passes through as well
+# GLTEST_SCISSOR="x y w h" passes through as well; GLTEST_PTS="x y x y ..." sets the sampled pixels
 # -e  extra environment for the grate run (e.g. "GRATE_FP_ROWS=2")
 # The grate run always has GRATE_DEBUG=tgsi (dump in /tmp/gt/t/<test>.err),
 # which also reports the chosen pixel rows and EXEC count.
@@ -41,7 +41,7 @@ scp -q "$HERE"/gltest "$@" ${VS:+"$VS"} "$HOST":/tmp/gt/t/
 
 names=
 for f in "$@"; do names="$names $(basename "$f")"; done
-ssh "$HOST" "cd /tmp/gt/t && TOL=\${TOL:-0.03} GENV='$ENV' BLEND='$BLEND' BCOL='${GLTEST_BLEND_COLOR:-}' CMASK='${GLTEST_COLORMASK:-}' SCIS='${GLTEST_SCISSOR:-}' VSF='$VSF' RGBA='${GLTEST_RGBA:-}' sh -s $names" <<'EOF'
+ssh "$HOST" "cd /tmp/gt/t && TOL=\${TOL:-0.03} GENV='$ENV' BLEND='$BLEND' BCOL='${GLTEST_BLEND_COLOR:-}' CMASK='${GLTEST_COLORMASK:-}' SCIS='${GLTEST_SCISSOR:-}' VSF='$VSF' RGBA='${GLTEST_RGBA:-}' XPTS='${GLTEST_PTS:-}' sh -s $names" <<'EOF'
 [ -n "$BLEND" ] && export GLTEST_BLEND="$BLEND"
 [ -n "$BCOL" ] && export GLTEST_BLEND_COLOR="$BCOL"
 [ -n "$CMASK" ] && export GLTEST_COLORMASK="$CMASK"
@@ -50,7 +50,7 @@ ssh "$HOST" "cd /tmp/gt/t && TOL=\${TOL:-0.03} GENV='$ENV' BLEND='$BLEND' BCOL='
 [ -n "$RGBA" ] && export GLTEST_RGBA=1
 export LD_LIBRARY_PATH=/tmp/gt/m/usr/lib
 export __EGL_VENDOR_LIBRARY_FILENAMES=/tmp/gt/m/usr/share/glvnd/egl_vendor.d/50_mesa.json
-PTS="8 8 56 8 8 56 32 32 20 44 44 20 3 60 60 3"
+PTS=${XPTS:-"8 8 56 8 8 56 32 32 20 44 44 20 3 60 60 3"}
 pass=0 fail=0
 for t in "$@"; do
   env GRATE_DEBUG=tgsi $GENV ./gltest "$t" $PTS > "$t.grate" 2> "$t.err"; rc=$?

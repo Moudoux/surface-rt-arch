@@ -1,0 +1,52 @@
+# rtshell: the Surface RT's touch shell (Rust/Smithay compositor, DESKTOP-SHELL.md), packaged from an already
+# finished cross build (build/shell/build.sh shell --release). Nothing is compiled here.
+# pkgver = Cargo's version; pkgrel = our build number (bump it to ship a new build). Build: build/repo/make-repo.sh
+# Plasma stays installed: this package only adds a session; greetd/SDDM setup stays a separate, root step.
+pkgname=rtshell
+pkgver=0.1.0
+pkgrel=7
+pkgdesc="Touch-first Wayland compositor and shell for the Surface RT (Tegra 3, grate)"
+arch=(armv7h)
+url="https://github.com/Moudoux/surface-rt-arch"
+license=(MIT)
+# Linked: libgbm (mesa-grate), libseat, libudev, libinput, libxkbcommon. dlopen()ed: libEGL/libGLESv2 (libglvnd),
+# libpam. Run: fc-match (fontconfig), the UI font "Adwaita Sans" (adwaita-fonts), the icon theme (breeze).
+depends=(mesa-grate libglvnd seatd systemd-libs libinput libxkbcommon pam fontconfig adwaita-fonts breeze-icons)
+optdepends=('greetd: rtshell as the login screen (rtshell --greeter, see /usr/share/rtshell/greetd)'
+            'foot: the default terminal (Super+Return)'
+            'xdg-utils: default web browser setting'
+            'networkmanager: Wi-Fi in the Control Center'
+            'upower: battery status'
+            'bluez: Bluetooth in the Control Center'
+            'iio-sensor-proxy: auto-rotate'
+            'wireplumber: volume keys and slider (wpctl)'
+            'libpulse: outside volume changes (pactl subscribe)')
+backup=(etc/rtshell/config.toml)
+options=(!strip !debug)
+
+_top=$(realpath "$startdir/../../..")
+_bin=$_top/shell/target/armv7-unknown-linux-gnueabihf/release/rtshell
+
+package() {
+  # Debug info is ~2/3 of the file: strip a copy (the unstripped one stays on the PC for addr2line/gdb).
+  install -d "$pkgdir/usr/bin"
+  llvm-strip -o "$pkgdir/usr/bin/rtshell" "$_bin"
+  chmod 755 "$pkgdir/usr/bin/rtshell"
+  install -Dm755 "$_top/build/shell/rtshell-session" "$pkgdir/usr/bin/rtshell-session"
+  # Session entry for display managers (SDDM lists it next to Plasma).
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/wayland-sessions/rtshell.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=rtshell
+Comment=Touch shell for the Surface RT
+Exec=/usr/bin/rtshell-session
+Type=Application
+DesktopNames=rtshell
+DESKTOP
+  # The greeter's config (read by `rtshell --greeter`, which cannot read /home), with /usr/bin paths.
+  sed 's|/usr/local/bin/|/usr/bin/|g' "$_top/build/shell/greetd/rtshell-greeter.toml" | install -Dm644 /dev/stdin "$pkgdir/etc/rtshell/config.toml"
+  # greetd's own /etc/greetd/config.toml belongs to greetd: only an example here.
+  sed 's|/usr/local/bin/|/usr/bin/|g' "$_top/build/shell/greetd/greetd-config.toml" | install -Dm644 /dev/stdin "$pkgdir/usr/share/rtshell/greetd/config.toml"
+  install -Dm644 "$_top/shell/assets/config.toml" "$pkgdir/usr/share/rtshell/config.toml.example"
+  install -Dm644 "$_top/shell/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 -t "$pkgdir/usr/share/rtshell/themes" "$_top"/shell/assets/themes/*.toml
+}

@@ -1,0 +1,54 @@
+[package]
+name = "rtshell"
+version = "0.1.0"
+edition = "2024"
+description = "Touch-first Wayland compositor and shell for the Surface RT (Tegra 3, grate)"
+license = "MIT"
+publish = false
+
+[features]
+default = ["udev", "xwayland"]
+# X11 apps through Xwayland (src/xwayland.rs; /usr/bin/Xwayland at runtime, `[apps] xwayland`).
+xwayland = ["smithay/xwayland"]
+# Real hardware: DRM/KMS + GBM + libinput + libseat (the Surface).
+udev = [
+  "smithay/backend_drm",
+  "smithay/backend_gbm",
+  "smithay/backend_libinput",
+  "smithay/backend_udev",
+  "smithay/backend_session_libseat",
+  "dep:smithay-drm-extras",
+]
+# Scripted lock-screen tests: the lock accepts only a fixed test PIN and never calls PAM. Never in
+# a default build (services/auth.rs).
+test-auth = []
+# Nested in a window on the host (`--nested`), for development.
+winit = ["smithay/backend_winit", "smithay/backend_drm"]
+
+[dependencies]
+# Same calloop as Smithay; `signals` for a clean exit on SIGTERM/SIGINT (run.sh -t, pkill).
+calloop = { version = "0.14", features = ["signals"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# Settings edits config.toml in place (comments and unknown keys kept).
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
+tracing = { version = "0.1", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+xcursor = "0.3"
+smithay-drm-extras = { path = "../sources/smithay/smithay-drm-extras", default-features = false, optional = true }
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+# SVG icons only: no text, system fonts or embedded raster images.
+resvg = { version = "0.50", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dependencies.smithay]
+path = "../sources/smithay"
+default-features = false
+features = ["desktop", "wayland_frontend", "backend_egl", "renderer_gl"]
+
+[profile.release]
+debug = "line-tables-only"

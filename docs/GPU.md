@@ -15,7 +15,7 @@ None of this can be fixed in software.
 | Layer | What |
 |---|---|
 | Kernel | libre-tegra 7.0.1 grate DRM driver (classic Tegra DRM ioctls), plus our 0030 (atomic completed-jobs accounting) and 0032 (GPU reset path: fence refcount fix, 1 s job timeout) |
-| Mesa | libre-tegra `grate-26.2.3` Gallium driver + ThatzOkay's series 0001-0019 + `build/mesa/grate-26.2.3-25.patch` (ours), packaged as `mesa-grate` (grate + softpipe/llvmpipe fallback, EGL/GBM/GLES1/2, GLX via libglvnd) |
+| Mesa | libre-tegra `grate-26.2.3` Gallium driver + ThatzOkay's series 0001-0019 + `build/mesa/grate-26.2.3-34.patch` (ours), packaged as `mesa-grate` (grate + softpipe/llvmpipe fallback, EGL/GBM/GLES1/2, GLX via libglvnd) |
 | KWin | 6.8.2 + `build/kde/fixups/kwin-surface-rt-gles2.patch` |
 | Qt Quick | stock Qt 6; `QSG_DISTANCEFIELD_ANTIALIASING=gray` (system-wide, from surface-rt-tools) |
 

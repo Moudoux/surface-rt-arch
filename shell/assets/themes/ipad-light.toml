@@ -1,0 +1,191 @@
+# rtshell theme "iPad light": the iPadOS-like style (DESKTOP-SHELL.md Phase 10). `style = "ipad"`
+# switches the layout too (the springboard Home: icon pages, page dots, dock, search pulled down), from the
+# next sign-in; the looks apply at once. Only what differs from the built-in "light" theme is here.
+# Layout and motion are evoked; no Apple artwork, icons or fonts are used.
+
+name = "iPad light"
+base = "light"
+style = "ipad"
+
+[colors]
+background = "#eef0f5"
+surface = "#ffffff"
+surface_glass = "#ffffffd0"
+accent = "#007aff"
+on_accent = "#ffffff"
+text = "#1c1c1e"
+text_dim = "#6c6c70"
+scrim = "#00000040"
+
+[shape]
+radius_small = 10
+radius_card = 20
+radius_panel = 26
+
+[motion]
+spring_stiffness = 300.0     # softer than the RT style's 380
+
+[glass]
+tint = "#ffffff70"
+
+[springboard]
+# See dark.toml for every token. Rounded-square app tiles, a widget column with a big clock on the left
+# (landscape), the icon grid to its right, a frosted dock.
+plate = "solid"
+plate_fill = "#f4f4f7"
+
+[control]
+# A floating rounded glass card (top right) instead of the flush Windows 8 pane.
+width = 380
+margin = 12
+padding = 18
+gap = 16
+radius = 26
+glass = true
+fill = "#f5f6f8b0"
+shadow = true
+dim = "#00000040"
+title = ""
+time_size = 34
+time_weight = 600
+toggle_off = "#0000000f"
+toggle_layout = "row"
+toggle_columns = 2
+toggle_height = 64
+toggle_gap = 10
+toggle_padding = 14
+toggle_radius = 18
+toggle_icon = 26
+slider_height = 48
+slider_track = 8
+slider_radius = 4
+slider_knob = 26
+knob_width = 26
+knob_radius = 13
+knob = "#ffffff"
+power_button = 52
+power_fill = false
+power_radius = 26
+power_icon = 26
+row_radius = 12
+row_selected = "#0000000f"
+field_radius = 10
+field_fill = "#ffffff"
+button_radius = 18
+
+[banner]
+# Rounded glass banners, top centre, sliding down from the top.
+anchor = "center"
+slide_from = "top"
+width = 440
+margin = 10
+padding = 14
+radius = 20
+glass = true
+fill = "#ffffffb8"
+text = "#1c1c1e"
+text_dim = "#1c1c1eb3"
+shadow = true
+
+[volume]
+# A horizontal glass pill at the top centre.
+anchor = "center"
+anchor_y = "top"
+orientation = "horizontal"
+margin = 16
+width = 320
+height = 56
+padding = 16
+gap = 12
+radius = 28
+glass = true
+fill = "#ffffffb8"
+shadow = true
+text = "#1c1c1e"
+number_size = 17
+number_weight = 600
+track = 6
+track_radius = 3
+track_fill = "#00000026"
+level_fill = "#1c1c1e"
+knob_length = 0
+fade_in_ms = 120
+fade_out_ms = 300
+
+[lock]
+# Centred large clock near the top; frosted sign-in; round PIN keys and user pictures.
+curtain_scrim = "#00000020"
+anchor = "center"
+anchor_y = "top"
+margin_y = 80
+text = "#ffffff"
+clock_size = 104
+clock_weight = 600
+date_size = 22
+date_weight = 500
+signin_glass = true
+signin_fill = "#ffffff60"
+signin_text = "#1c1c1e"
+field_radius = 12
+field_border = 0
+field_fill = "#ffffffd0"
+field_text = "#1c1c1e"
+field_placeholder = "#1c1c1e80"
+pin_key = 76
+pin_gap = 18
+pin_radius = 38
+pin_fill = "#00000014"
+pin_text = "#1c1c1e"
+pin_size = 32
+pin_weight = 400
+user_tile = 104
+user_tile_radius = 52
+user_tile_fill = "#00000014"
+user_initial_weight = 500
+
+[settings]
+# Rounded chips and a grouped sidebar.
+fill = "#f2f2f7"
+nav_fill = "#ffffff"
+nav_row_height = 48
+padding = 36
+title_size = 34
+title_weight = 700
+heading_size = 28
+heading_weight = 700
+chip_radius = 10
+chip_fill = "#ffffff"
+chip_text = "#1c1c1e"
+text = "#1c1c1e"
+text_dim = "#6c6c70"
+ring = 3
+
+[osk]
+# Rounded keys with gaps on a translucent base.
+fill = "#d1d4dbf0"
+key = "#ffffff"
+key_fn = "#acb1ba"
+key_pressed = "#d8dbe1"
+key_latched = "#ffffff"
+key_locked = "#007aff"
+text = "#1c1c1e"
+text_fn = "#1c1c1e"
+preview_fill = "#ffffff"
+preview_text = "#1c1c1e"
+accent_fill = "#ffffff"
+accent_selected = "#007aff"
+gap = 8
+padding = 8
+radius = 8
+preview_radius = 10
+shadow = true
+
+[split]
+divider = 10
+divider_color = "#000000"
+handle_color = "#ffffffb3"
+handle_length = 48
+handle_thickness = 5
+snap_color = "#007aff"
+handle_active = "#007aff"
+drop_color = "#007aff50"

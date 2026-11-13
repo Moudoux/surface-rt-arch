@@ -3,7 +3,7 @@
 # pkgrel = our kernel build number (build #6 -> 7.0.1-6). Build: build/repo/make-repo.sh
 pkgname=linux-surface-rt
 pkgver=7.0.1
-pkgrel=6
+pkgrel=7
 pkgdesc="Linux kernel for the Microsoft Surface RT (Tegra 3), APX/U-Boot boot"
 arch=(armv7h)
 url="https://github.com/Moudoux/surface-rt-arch"

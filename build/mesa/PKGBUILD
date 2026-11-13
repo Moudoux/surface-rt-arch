@@ -1,7 +1,7 @@
 # Mesa with the grate (Tegra 2/3 GR3D) Gallium driver + Surface RT patches 0001-0019.
 pkgname=mesa-grate
 pkgver=26.2.3
-pkgrel=25
+pkgrel=34
 pkgdesc="Mesa with the open-source grate driver for NVIDIA Tegra 3 (Surface RT)"
 arch=(armv7h)
 url="https://codeberg.org/libre-tegra/mesa"

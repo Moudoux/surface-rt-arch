@@ -200,7 +200,7 @@ index 2c6e0b1..7286fdf 100644
      struct {
          uint32_t id;
 diff --git a/src/gallium/drivers/grate/fp/tgsi.c b/src/gallium/drivers/grate/fp/tgsi.c
-index 0149b33..6fc5660 100644
+index 0149b33..3f0474e 100644
 --- a/src/gallium/drivers/grate/fp/tgsi.c
 +++ b/src/gallium/drivers/grate/fp/tgsi.c
 @@ -1,12 +1,45 @@
@@ -310,12 +310,18 @@ index 0149b33..6fc5660 100644
        if (fp->temp_dst[dst->Index][subreg] < 0) {
           /* Internal interpolation staging lives only within this instruction. */
           assert(dst->Index == fp->num_temporaries);
-@@ -159,20 +211,115 @@ fp_constant(struct grate_fp_shader *fp, int word, float immediate)
+@@ -155,24 +207,269 @@ fp_alu_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst, int
+ }
+ 
+ static struct fp_alu_src_operand
+-fp_constant(struct grate_fp_shader *fp, int word, float immediate)
++fp_constant_scaled(struct grate_fp_shader *fp, int word, float immediate, unsigned scale)
  {
     unsigned i;
     for (i = 0; i < fp->info.num_constants; i++) {
 -      if (fp->info.constants[i].word == word &&
 +      if (fp->info.constants[i].word == word && !fp->info.constants[i].fx10 &&
++          fp->info.constants[i].scale == scale &&
            (word >= 0 || fp->info.constants[i].immediate == immediate))
           break;
     }
@@ -339,15 +345,71 @@ index 0149b33..6fc5660 100644
 +      return fp_alu_src_zero();
 +   }
     if (i == fp->info.num_constants) {
++      memset(&fp->info.constants[i], 0, sizeof(fp->info.constants[i]));
        fp->info.constants[i].word = word;
        fp->info.constants[i].immediate = immediate;
-+      fp->info.constants[i].fx10 = false;
++      fp->info.constants[i].scale = scale;
        fp->info.num_constants++;
     }
     struct fp_alu_src_operand value = {.index = 32 + i};
     return value;
  }
  
++static struct fp_alu_src_operand
++fp_constant(struct grate_fp_shader *fp, int word, float immediate)
++{
++   return fp_constant_scaled(fp, word, immediate, GRATE_FP_SCALE_NONE);
++}
++
++/* An FX10 pair register holding constant words lo and hi (hi < 0: none). */
++static bool
++fp_fx10_pair(struct grate_fp_shader *fp, int lo, int hi, unsigned scale, bool diffuse, bool high,
++             struct fp_alu_src_operand *value)
++{
++   unsigned i;
++   for (i = 0; i < fp->info.num_constants; i++)
++      if (fp->info.constants[i].fx10 && fp->info.constants[i].word == lo &&
++          fp->info.constants[i].word_hi == hi && fp->info.constants[i].scale == scale)
++         break;
++   if (i >= 32) {
++      fp->constants_overflow = true;
++      fp_reject(fp, "more than 32 scalar constants+immediates, need", i + 1);
++      *value = fp_alu_src_zero();
++      return true;
++   }
++   if (i == fp->info.num_constants) {
++      memset(&fp->info.constants[i], 0, sizeof(fp->info.constants[i]));
++      fp->info.constants[i].word = lo;
++      fp->info.constants[i].word_hi = hi;
++      fp->info.constants[i].fx10 = true;
++      fp->info.constants[i].scale = scale;
++      fp->info.constants[i].diffuse = diffuse;
++      fp->info.num_constants++;
++   }
++   struct fp_alu_src_operand v = {
++      .index = 32 + i, .datatype = FP_DATATYPE_FIXED10, .sub_reg_select_high = high,
++   };
++   *value = v;
++   return true;
++}
++
++/* A scalar-packed constant word (fp->spack): half of an FX10 pair. */
++static bool
++fp_spacked_constant(struct grate_fp_shader *fp, int word, struct fp_alu_src_operand *value)
++{
++   for (unsigned kind = 0; kind < 2; kind++) {
++      for (unsigned k = 0; k < fp->num_spack[kind]; k++) {
++         if (fp->spack[kind][k] != word)
++            continue;
++         const unsigned pair = k & ~1u;
++         const int hi = pair + 1 < fp->num_spack[kind] ? fp->spack[kind][pair + 1] : -1;
++         return fp_fx10_pair(fp, fp->spack[kind][pair], hi,
++                             kind == 0 ? GRATE_FP_SCALE_DIV : GRATE_FP_SCALE_NONE, kind == 1, k & 1, value);
++      }
++   }
++   return false;
++}
++
 +/* Channel comp of a packed colour constant (fp->packed): an FX10 half. */
 +static bool
 +fp_packed_constant(struct grate_fp_shader *fp, int index, unsigned comp,
@@ -360,27 +422,119 @@ index 0149b33..6fc5660 100644
 +   if (p == fp->num_packed)
 +      return false;
 +   int word = index * 4 + (comp & ~1u);
-+   unsigned i;
-+   for (i = 0; i < fp->info.num_constants; i++)
-+      if (fp->info.constants[i].fx10 && fp->info.constants[i].word == word)
-+         break;
-+   if (i >= 32) {
-+      fp->constants_overflow = true;
-+      fp_reject(fp, "more than 32 scalar constants+immediates, need", i + 1);
-+      *value = fp_alu_src_zero();
-+      return true;
++   return fp_fx10_pair(fp, word, word + 1, GRATE_FP_SCALE_NONE, false, comp & 1, value);
++}
++
++/* Is word in list (n entries)? Appends it if `add`. */
++static bool
++fp_word_listed(int *list, unsigned *n, unsigned max, int word, bool add)
++{
++   for (unsigned i = 0; i < *n; i++)
++      if (list[i] == word)
++         return true;
++   if (add && *n < max)
++      list[(*n)++] = word;
++   return false;
++}
++
++/* Two more pack levels after the colours, for programs that still need more
++ * than 32 constants (Skia's 12 and 16 tap blurs with a clamp: up to 42):
++ *  1. the per-tap factors `a` of GRATE_FP_KEEP_PRODUCT MADs (a * E + base,
++ *     fp/reassoc.c), two per register as FX10 halves holding a / S; the E
++ *     words are uploaded times S. S is a power of two chosen per draw from
++ *     the largest |a| (emit_fs_uniforms()), so the halves use the FX10 range
++ *     whatever the offsets are (step = S / 256 of an offset unit);
++ *  2. constant words that only ever multiply a texture sample (kernel
++ *     weights), as FX10 halves (-2 .. 2, step 1/256); the upload carries
++ *     each rounding error into the next weight, so their sum stays exact.
++ * A word qualifies only if all its uses have that form. */
++static void
++fp_choose_scalar_packs(struct grate_fp_shader *fp, const struct tgsi_full_instruction *code, unsigned count)
++{
++   int a_words[32], e_words[32], w_words[32], bad[256];
++   unsigned na = 0, ne = 0, nw = 0, nbad = 0;
++   bool offsets = true;
++   uint8_t tex[GRATE_FP_MAX_TEMPS + 1] = {0}; /* components holding a texture sample */
++
++   fp->num_spack[0] = fp->num_spack[1] = 0;
++   for (unsigned k = 0; k < count; k++) {
++      const struct tgsi_full_instruction *inst = &code[k];
++      const unsigned opcode = inst->Instruction.Opcode;
++      const bool keep = opcode == TGSI_OPCODE_MAD && GRATE_FP_KEEP_PRODUCT(inst);
++      const unsigned mask = inst->Instruction.NumDstRegs ? inst->Dst[0].Register.WriteMask : 0;
++      for (unsigned s = 0; s < inst->Instruction.NumSrcRegs; s++) {
++         const struct tgsi_src_register *r = &inst->Src[s].Register;
++         if (r->File != TGSI_FILE_CONSTANT)
++            continue;
++         const unsigned swizzle[] = {r->SwizzleX, r->SwizzleY, r->SwizzleZ, r->SwizzleW};
++         /* does this operand multiply a texture sample? */
++         bool weight = (opcode == TGSI_OPCODE_MUL || opcode == TGSI_OPCODE_MAD) && s < 2 && !keep &&
++                       !r->Indirect && !r->Absolute && r->Index < GRATE_FP_PRE_INDEX;
++         const struct tgsi_src_register *other = &inst->Src[1 - (s & 1)].Register;
++         const unsigned oswz[] = {other->SwizzleX, other->SwizzleY, other->SwizzleZ, other->SwizzleW};
++         if (weight && (other->File != TGSI_FILE_TEMPORARY || other->Indirect || other->Index >= GRATE_FP_MAX_TEMPS))
++            weight = false;
++         for (unsigned c = 0; c < 4; c++) {
++            if (!(mask & (1 << c)) && inst->Instruction.NumDstRegs)
++               continue;
++            const int word = r->Index * 4 + swizzle[c];
++            if (keep && s == 0 && !r->Indirect && !r->Absolute && r->Index < GRATE_FP_PRE_INDEX) {
++               fp_word_listed(a_words, &na, 32, word, true);
++            } else if (keep && s == 1 && !r->Indirect && !r->Absolute) {
++               fp_word_listed(e_words, &ne, 32, word, true);
++               if (r->Index >= GRATE_FP_PRE_INDEX && fp->pre_known[(r->Index - GRATE_FP_PRE_INDEX) * 4 + swizzle[c]])
++                  offsets = false; /* folded to an immediate: cannot be scaled */
++            } else if (weight && (tex[other->Index] & (1 << oswz[c]))) {
++               fp_word_listed(w_words, &nw, 32, word, true);
++            } else {
++               if (keep && s < 2)
++                  offsets = false;
++               fp_word_listed(bad, &nbad, 256, word, true);
++               if (nbad == 256)
++                  return;
++            }
++         }
++      }
++      if (inst->Instruction.NumDstRegs == 1 && inst->Dst[0].Register.File == TGSI_FILE_TEMPORARY &&
++          inst->Dst[0].Register.Index < GRATE_FP_MAX_TEMPS) {
++         if (opcode == TGSI_OPCODE_TEX)
++            tex[inst->Dst[0].Register.Index] |= mask;
++         else
++            tex[inst->Dst[0].Register.Index] &= ~mask;
++      }
 +   }
-+   if (i == fp->info.num_constants) {
-+      fp->info.constants[i].word = word;
-+      fp->info.constants[i].immediate = 0.0f;
-+      fp->info.constants[i].fx10 = true;
-+      fp->info.num_constants++;
++   /* every use of a packed word must have had the packed form */
++   for (unsigned i = 0; i < na; i++)
++      offsets &= !fp_word_listed(bad, &nbad, 256, a_words[i], false) &&
++                 !fp_word_listed(w_words, &nw, 32, a_words[i], false) &&
++                 !fp_word_listed(e_words, &ne, 32, a_words[i], false);
++   for (unsigned i = 0; i < ne; i++)
++      offsets &= !fp_word_listed(bad, &nbad, 256, e_words[i], false) &&
++                 !fp_word_listed(w_words, &nw, 32, e_words[i], false);
++   for (unsigned p = 0; p < fp->num_packed; p++) /* not also in a packed colour */
++      for (unsigned i = 0; i < na; i++)
++         offsets &= a_words[i] / 4 != fp->packed[p];
++   offsets &= na >= 2;
++   unsigned good_w = 0;
++   for (unsigned i = 0; i < nw; i++) {
++      bool ok = !fp_word_listed(bad, &nbad, 256, w_words[i], false);
++      for (unsigned p = 0; p < fp->num_packed; p++)
++         ok &= w_words[i] / 4 != fp->packed[p];
++      if (ok)
++         w_words[good_w++] = w_words[i];
 +   }
-+   struct fp_alu_src_operand v = {
-+      .index = 32 + i, .datatype = FP_DATATYPE_FIXED10, .sub_reg_select_high = comp & 1,
-+   };
-+   *value = v;
-+   return true;
++   const bool weights = good_w >= 2;
++
++   const unsigned colours = fp->num_pack_candidates;
++   fp->num_pack_candidates += offsets + weights;
++   if (offsets && fp->pack_colors > colours) {
++      memcpy(fp->spack[0], a_words, na * sizeof(int));
++      fp->num_spack[0] = na;
++   }
++   if (weights && fp->pack_colors > colours + offsets) {
++      memcpy(fp->spack[1], w_words, good_w * sizeof(int));
++      fp->num_spack[1] = good_w;
++   }
 +}
 +
 +/* Colour-like vec4 constants: every read is .xyzw into a .xyzw destination
@@ -423,12 +577,13 @@ index 0149b33..6fc5660 100644
 +      if (fp->num_packed < MIN2(fp->pack_colors, 16))
 +         fp->packed[fp->num_packed++] = candidates[c];
 +   }
++   fp_choose_scalar_packs(fp, code, count);
 +}
 +
  static struct fp_alu_src_operand
  fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
              unsigned component, struct fp_mfu_instr *mfu)
-@@ -184,7 +331,11 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+@@ -184,7 +481,11 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
     switch (src->File) {
     case TGSI_FILE_INPUT:
        /* Interpolate the selected source channel, not the destination channel. */
@@ -441,30 +596,38 @@ index 0149b33..6fc5660 100644
        assert(mfu->var[comp].op == FP_VAR_OP_NOP || mfu->var[comp].tram_row == src->Index);
        mfu->var[comp].op = FP_VAR_OP_FP20;
        mfu->var[comp].tram_row = src->Index;
-@@ -198,11 +349,31 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+@@ -198,11 +499,38 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
        break;
     }
     case TGSI_FILE_CONSTANT:
 -      assert(!src->Indirect);
+-      value = fp_constant(fp, src->Index * 4 + comp, 0.0f);
 +      if (src->Indirect) {
 +         fp_reject(fp, "indirect constant access, file", src->File);
 +         return fp_alu_src_zero();
 +      }
 +      if (fp->num_packed && fp_packed_constant(fp, src->Index, comp, &value))
 +         break;
-+      if (src->Index >= GRATE_FP_PRE_INDEX) {
-+         /* preamble result: folded to an immediate, or a copy of another word */
-+         unsigned w = (src->Index - GRATE_FP_PRE_INDEX) * 4 + comp;
-+         if (fp->pre_known[w]) {
-+            float imm = fp->pre_value[w];
-+            value = imm == 1.0f ? fp_alu_src_one() :
-+                    imm == 0.0f ? fp_alu_src_zero() : fp_constant(fp, -1, imm);
-+         } else {
-+            value = fp_constant(fp, fp->pre_alias[w], 0.0f);
-+         }
++      if ((fp->num_spack[0] || fp->num_spack[1]) && src->Index < GRATE_FP_PRE_INDEX &&
++          fp_spacked_constant(fp, src->Index * 4 + comp, &value))
 +         break;
++      {
++         /* the partner of packed tap offsets: uploaded times their scale */
++         const unsigned scale = src == fp->scale_operand ? GRATE_FP_SCALE_MUL : GRATE_FP_SCALE_NONE;
++         if (src->Index >= GRATE_FP_PRE_INDEX) {
++            /* preamble result: folded to an immediate, or a copy of another word */
++            unsigned w = (src->Index - GRATE_FP_PRE_INDEX) * 4 + comp;
++            if (fp->pre_known[w]) {
++               float imm = fp->pre_value[w];
++               value = imm == 1.0f ? fp_alu_src_one() :
++                       imm == 0.0f ? fp_alu_src_zero() : fp_constant(fp, -1, imm);
++            } else {
++               value = fp_constant_scaled(fp, fp->pre_alias[w], 0.0f, scale);
++            }
++            break;
++         }
++         value = fp_constant_scaled(fp, src->Index * 4 + comp, 0.0f, scale);
 +      }
-       value = fp_constant(fp, src->Index * 4 + comp, 0.0f);
        break;
     case TGSI_FILE_TEMPORARY:
 -      assert(src->Index <= GRATE_FP_MAX_TEMPS);
@@ -475,7 +638,7 @@ index 0149b33..6fc5660 100644
        int reg = fp->temp_src[src->Index][comp];
        assert(reg >= 0 || fp->allocation_failed);
        value = fp_alu_src_row(0);
-@@ -211,13 +382,39 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
+@@ -211,13 +539,39 @@ fp_tgsi_src(struct grate_fp_shader *fp, const struct tgsi_src_register *src,
        value.sub_reg_select_high = !!(reg & TEMP_HIGH);
        break;
     default:
@@ -516,7 +679,7 @@ index 0149b33..6fc5660 100644
  static void
  setup_interpolation(struct fp_mfu_instr *mfu)
  {
-@@ -247,6 +444,14 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+@@ -247,6 +601,14 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
        setup_interpolation(mfu);
     }
  
@@ -531,7 +694,7 @@ index 0149b33..6fc5660 100644
     bool output_stage = false;
     const struct tgsi_src_register *operands[] = {src, rhs, third};
     if (dst->File == TGSI_FILE_OUTPUT) {
-@@ -267,7 +472,7 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+@@ -267,7 +629,7 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
        src->SwizzleZ == TGSI_SWIZZLE_Z && src->SwizzleW == TGSI_SWIZZLE_W;
     for (unsigned c = 0; direct_pack && c < 4; c++)
        direct_pack = fp->temp_src[src->Index][c] == (int)c;
@@ -540,7 +703,7 @@ index 0149b33..6fc5660 100644
        output_stage = false;
     struct fp_alu_instr_packet *alu = CALLOC_STRUCT(fp_alu_instr_packet);
     int alu_instrs = 0;
-@@ -278,8 +483,26 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+@@ -278,8 +640,26 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
        if ((dst->WriteMask & (1 << i)) == 0)
           continue;
  
@@ -569,7 +732,7 @@ index 0149b33..6fc5660 100644
        struct fp_alu_instr op = fp_alu_sMOV(fp_alu_dst(fp, dst, i, saturate), a);
        op.src[1] = b;
        switch (opcode) {
-@@ -306,6 +529,23 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+@@ -306,6 +686,23 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
           op.op = FP_ALU_OP_CSEL;
           op.src[2] = fp_tgsi_src(fp, third, i, mfu);
           break;
@@ -593,7 +756,7 @@ index 0149b33..6fc5660 100644
        default:
           break;
        }
-@@ -356,8 +596,16 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
+@@ -356,8 +753,16 @@ emit_vALU(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
     list_addtail(&inst->link, &fp->fp_instructions);
  }
  
@@ -612,7 +775,7 @@ index 0149b33..6fc5660 100644
   */
  static void
  emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
-@@ -365,29 +613,62 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
+@@ -365,29 +770,69 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
     const struct tgsi_src_register *coord = &tgsi->Src[0].Register;
     const struct tgsi_src_register *sampler = &tgsi->Src[1].Register;
     const struct tgsi_dst_register *dst = &tgsi->Dst[0].Register;
@@ -626,6 +789,10 @@ index 0149b33..6fc5660 100644
 +      return;
 +   }
 +   const bool plain = coord->File == TGSI_FILE_INPUT && !coord->Negate && !coord->Absolute;
++   /* computed straight into r0/r1 (fp_direct_coords()) */
++   const bool direct = coord->File == TGSI_FILE_TEMPORARY && !coord->Negate && !coord->Absolute &&
++      coord->Index < GRATE_FP_MAX_TEMPS && coord->SwizzleX == 0 && coord->SwizzleY == 1 &&
++      fp->temp_src[coord->Index][0] == 0 && fp->temp_src[coord->Index][1] == 1;
 +   unsigned first = 0;
 +   if (plain && coord->SwizzleX == 0 && coord->SwizzleY == 1)
 +      first = 0;
@@ -642,7 +809,10 @@ index 0149b33..6fc5660 100644
 -   for (unsigned i = 0; i < 2; i++) {
 -      mfu->var[i].op = FP_VAR_OP_FP20;
 -      mfu->var[i].tram_row = coord->Index;
-+   if (first < 4) {
++   if (direct) {
++      FREE(interp);
++      first = 0;
++   } else if (first < 4) {
 +      struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
 +      list_inithead(&mfu->link);
 +      setup_interpolation(mfu);
@@ -691,7 +861,7 @@ index 0149b33..6fc5660 100644
     if (dst->File == TGSI_FILE_TEMPORARY && fp->texture_rows) {
        list_addtail(&sample->link, &fp->fp_instructions);
        return;
-@@ -416,13 +697,144 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
+@@ -416,13 +861,144 @@ emit_TEX(struct grate_fp_shader *fp, const struct tgsi_full_instruction *tgsi)
     list_addtail(&sample->link, &fp->fp_instructions);
  }
  
@@ -838,7 +1008,7 @@ index 0149b33..6fc5660 100644
     }
  
     switch (inst->Instruction.Opcode) {
-@@ -438,48 +850,32 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+@@ -438,48 +1014,32 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
     case TGSI_OPCODE_SLT:
     case TGSI_OPCODE_SGE:
     case TGSI_OPCODE_SEQ:
@@ -903,12 +1073,15 @@ index 0149b33..6fc5660 100644
           struct tgsi_dst_register scratch = {0};
           scratch.File = TGSI_FILE_TEMPORARY;
           scratch.Index = fp->num_temporaries;
-@@ -493,13 +889,71 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
+@@ -493,13 +1053,74 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
           staged.SwizzleW = TGSI_SWIZZLE_W;
           *inputs[i] = &staged;
        }
 -      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, c, TGSI_OPCODE_CMP);
++      if (inst->Instruction.Opcode == TGSI_OPCODE_MAD && GRATE_FP_KEEP_PRODUCT(inst) && fp->num_spack[0])
++         fp->scale_operand = b;
 +      emit_vALU(fp, &inst->Dst[0].Register, saturate, a, b, c, inst->Instruction.Opcode);
++      fp->scale_operand = NULL;
 +      break;
 +   }
 +
@@ -978,7 +1151,7 @@ index 0149b33..6fc5660 100644
     }
  }
  
-@@ -514,7 +968,11 @@ static void
+@@ -514,7 +1135,11 @@ static void
  emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *decl)
  {
     grate_trace();
@@ -991,26 +1164,156 @@ index 0149b33..6fc5660 100644
  
     uint32_t src = LINK_SRC(decl->Range.First + 1) | (decl->Range.First << 9);
     uint32_t dst = 0;
-@@ -611,8 +1069,17 @@ emit_tgsi_declaration(struct grate_fp_shader *fp, const struct tgsi_full_declara
+@@ -523,6 +1148,9 @@ emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *
+ 
+    fp->info.inputs[fp->info.num_inputs].src = src;
+    fp->info.inputs[fp->info.num_inputs].dst = dst;
++   fp->info.inputs[fp->info.num_inputs].tgsi_in = decl->Range.First;
++   fp->info.in_sem_name[decl->Range.First] = decl->Semantic.Name;
++   fp->info.in_sem_index[decl->Range.First] = decl->Semantic.Index;
+ 
+    if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
+       fp->info.color_input = decl->Range.First;
+@@ -562,6 +1190,7 @@ emit_direct_varying_product(struct grate_fp_shader *fp,
+          unsigned row = c * 2 + operand;
+          unsigned export = operand ? b->Index : a->Index;
+          fp->info.inputs[row].src = LINK_SRC(export + 1) | (row << 9);
++         fp->info.inputs[row].tgsi_in = export;
+          fp->info.inputs[row].dst = LINK_DST(swizzle[operand][c], operand, LINK_DST_FP20);
+       }
+       struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
+@@ -610,9 +1239,129 @@ emit_tgsi_declaration(struct grate_fp_shader *fp, const struct tgsi_full_declara
+    }
  }
  
++/* Does the instruction use the pixel-row registers R0-R3 itself (varying
++ * interpolation, texture fetch, special function)? */
++static bool
++fp_row_user(const struct tgsi_full_instruction *inst)
++{
++   switch (inst->Instruction.Opcode) {
++   case TGSI_OPCODE_TEX:
++   case TGSI_OPCODE_RCP:
++   case TGSI_OPCODE_RSQ:
++   case TGSI_OPCODE_SQRT:
++   case TGSI_OPCODE_LG2:
++   case TGSI_OPCODE_EX2:
++   case TGSI_OPCODE_FRC:
++   case TGSI_OPCODE_FLR:
++      return true;
++   default:
++      break;
++   }
++   for (unsigned s = 0; s < inst->Instruction.NumSrcRegs; s++)
++      if (inst->Src[s].Register.File == TGSI_FILE_INPUT)
++         return true;
++   return false;
++}
++
++/* Texture coordinates computed right before their TEX can be written into
++ * r0/r1 by the ALU operation itself: no staging packet, no pool register.
++ * direct[n] gets bit c if instruction n may write component c (x or y) of
++ * its destination into r<c>. Conditions: plain ALU instruction without
++ * varying operands; the component is read only by that TEX, as coordinate c;
++ * nothing between uses R0-R3. GRATE_FP_DIRECT_COORD=0 disables it. */
++static void
++fp_direct_coords(const struct tgsi_full_instruction *code, unsigned count,
++                 uint8_t (*live_after)[GRATE_FP_MAX_TEMPS], uint8_t *direct)
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = debug_get_bool_option("GRATE_FP_DIRECT_COORD", true);
++   if (!enabled)
++      return;
++   for (unsigned m = 0; m < count; m++) {
++      const struct tgsi_full_instruction *tex = &code[m];
++      const struct tgsi_src_register *coord = &tex->Src[0].Register;
++      if (tex->Instruction.Opcode != TGSI_OPCODE_TEX || coord->File != TGSI_FILE_TEMPORARY ||
++          coord->Indirect || coord->Negate || coord->Absolute || coord->Index >= GRATE_FP_MAX_TEMPS ||
++          coord->SwizzleX != 0 || coord->SwizzleY != 1)
++         continue;
++      const unsigned t = coord->Index;
++      const struct tgsi_dst_register *td = &tex->Dst[0].Register;
++      const unsigned redefined = td->File == TGSI_FILE_TEMPORARY && (unsigned)td->Index == t ? td->WriteMask : 0;
++      int writer[2] = {-1, -1};
++      bool ok = true;
++      for (unsigned c = 0; c < 2 && ok; c++) {
++         if ((live_after[m + 1][t] & ~redefined) & (1 << c))
++            ok = false;
++         for (int n = (int)m - 1; n >= 0 && ok; n--) {
++            const struct tgsi_full_instruction *inst = &code[n];
++            const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
++            if (inst->Instruction.NumDstRegs == 1 && dst->File == TGSI_FILE_TEMPORARY &&
++                (unsigned)dst->Index == t && (dst->WriteMask & (1 << c))) {
++               switch (inst->Instruction.Opcode) {
++               case TGSI_OPCODE_MOV: case TGSI_OPCODE_ADD: case TGSI_OPCODE_MUL: case TGSI_OPCODE_MAD:
++               case TGSI_OPCODE_MIN: case TGSI_OPCODE_MAX:
++                  ok = !fp_row_user(inst);
++                  break;
++               default:
++                  ok = false;
++                  break;
++               }
++               writer[c] = n;
++               break;
++            }
++            if (fp_row_user(inst))
++               ok = false;
++            for (unsigned s = 0; s < inst->Instruction.NumSrcRegs; s++) {
++               const struct tgsi_src_register *r = &inst->Src[s].Register;
++               if (r->File == TGSI_FILE_TEMPORARY && (unsigned)r->Index == t &&
++                   (tgsi_util_get_inst_usage_mask(inst, s) & (1 << c)))
++                  ok = false;
++            }
++         }
++         ok &= writer[c] >= 0;
++      }
++      if (ok) {
++         direct[writer[0]] |= 1;
++         direct[writer[1]] |= 2;
++      }
++   }
++}
++
++/* A TEX result can stay in R2/R3 (no copy to the pool, read as FX10 halves)
++ * if it is dead before the next instruction that uses the row registers.
++ * GRATE_FP_TEX_STAYS=0 disables it. */
++static bool
++fp_texture_stays(const struct tgsi_full_instruction *code, unsigned count, unsigned n,
++                 uint8_t (*live_after)[GRATE_FP_MAX_TEMPS])
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = debug_get_bool_option("GRATE_FP_TEX_STAYS", true);
++   const struct tgsi_dst_register *dst = &code[n].Dst[0].Register;
++   if (!enabled || code[n].Instruction.Opcode != TGSI_OPCODE_TEX || dst->File != TGSI_FILE_TEMPORARY)
++      return false;
++   for (unsigned k = n + 1; k < count; k++)
++      if (fp_row_user(&code[k]))
++         return !(live_after[k][dst->Index] & dst->WriteMask);
++   return true;
++}
++
  void
 -grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
 +grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
 +                 unsigned rows, bool quiet, bool hoist, unsigned pack_colors,
-+                 unsigned schedule)
++                 unsigned schedule, bool reassoc)
  {
 +   fp->scheduled = false;
++   fp->reassociated = false;
 +   fp->pack_colors = pack_colors;
 +   fp->num_packed = 0;
 +   fp->num_pack_candidates = 0;
++   fp->num_spack[0] = fp->num_spack[1] = 0;
++   fp->scale_operand = NULL;
 +   fp->constants_overflow = false;
 +   fp->rows = rows;
 +   fp->quiet = quiet;
     list_inithead(&fp->fp_instructions);
     list_inithead(&fp->alu_instructions);
     list_inithead(&fp->mfu_instructions);
-@@ -621,6 +1088,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -621,6 +1370,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
     fp->info.num_constants = 0;
     fp->info.color_input = -1;
     fp->info.max_tram_row = 1;
@@ -1019,7 +1322,7 @@ index 0149b33..6fc5660 100644
     fp->num_immediates = 0;
     fp->num_temporaries = 0;
     fp->allocation_failed = false;
-@@ -637,7 +1106,10 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -637,7 +1388,10 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
           const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
           unsigned n = imm->Immediate.NrTokens - 1; /* number of 32-bit values: 1 to 4 */
  
@@ -1031,10 +1334,22 @@ index 0149b33..6fc5660 100644
           for (unsigned i = 0; i < 4; ++i)
              fp->immediates[fp->num_immediates][i] = i < n ? imm->u[i].Float : 0.0f;
           fp->num_immediates++;
-@@ -661,18 +1133,76 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -661,18 +1415,88 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
        return;
     }
  
++   /* Blur taps: coordinate = factor * E + base (fp/reassoc.c); needs the
++    * preamble for E. */
++   if (reassoc && hoist) {
++      fp->reassociated = grate_fp_reassociate(fp, &instructions);
++      if (fp->reassociated && (grate_debug & GRATE_DEBUG_TGSI) && !fp->quiet) {
++         fprintf(stderr, "REASSOCIATED program:\n");
++         unsigned k = 0;
++         util_dynarray_foreach(&instructions, struct tgsi_full_instruction, it)
++            tgsi_dump_instruction(it, k++);
++      }
++   }
++
 +   /* Uniform-only arithmetic is evaluated on the CPU (fp/preamble.c). */
 +   if (hoist) {
 +      grate_fp_hoist_preamble(fp, &instructions);
@@ -1109,7 +1424,7 @@ index 0149b33..6fc5660 100644
           if (output_temps[index] < 0)
              output_temps[index] = fp->num_temporaries++;
           output_masks[index] |= dst->WriteMask;
-@@ -697,7 +1227,14 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -697,7 +1521,14 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
        store.Src[0].Register.SwizzleW = TGSI_SWIZZLE_W;
        util_dynarray_append_typed(&instructions, struct tgsi_full_instruction, store);
     }
@@ -1125,7 +1440,27 @@ index 0149b33..6fc5660 100644
     unsigned count = util_dynarray_num_elements(&instructions, struct tgsi_full_instruction);
     struct tgsi_full_instruction *code = instructions.data;
     uint8_t (*live_after)[GRATE_FP_MAX_TEMPS] = calloc(count + 1, sizeof(*live_after));
-@@ -764,7 +1301,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -721,6 +1552,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+             live_after[n][reg->Index] |= tgsi_util_get_inst_usage_mask(inst, src);
+       }
+    }
++   uint8_t *direct = calloc(count + 1, 1);
++   assert(direct);
++   fp_direct_coords(code, count, live_after, direct);
+    for (unsigned n = 0; n < count; n++) {
+       const struct tgsi_full_instruction *inst = &code[n];
+       bool single_input = true;
+@@ -732,7 +1566,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+          input = reg->Index;
+       }
+       fp->late_rows = (int)n > last_fetch || ((int)n == last_fetch && single_input);
+-      fp->texture_rows = (int)n == last_fetch && inst->Instruction.Opcode == TGSI_OPCODE_TEX;
++      fp->texture_rows = ((int)n == last_fetch && inst->Instruction.Opcode == TGSI_OPCODE_TEX) ||
++                         fp_texture_stays(code, count, n, live_after);
+       memset(fp->claimed, 0, sizeof(fp->claimed));
+       memset(fp->reusable, 0, sizeof(fp->reusable));
+       memcpy(fp->temp_dst, fp->temp_src, sizeof(fp->temp_dst));
+@@ -764,7 +1599,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
                 simple &= inst->Src[src].Register.File != TGSI_FILE_INPUT;
              if (simple) {
                 for (unsigned reg = 0; reg < 24; reg++) {
@@ -1135,7 +1470,18 @@ index 0149b33..6fc5660 100644
                    unsigned needed = 0;
                    for (unsigned t = 0; t < fp->num_temporaries; t++) for (unsigned k = 0; k < 4; k++) {
                       int loc = fp->temp_src[t][k];
-@@ -795,7 +1333,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -790,12 +1626,18 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+                   fp->reusable[reg] = (~needed) & 3;
+                }
+             }
++            if ((direct[n] & (1 << c)) && !fp->occupied[c] && (live_after[n + 1][dst->Index] & (1 << c))) {
++               /* texture coordinate: r0/r1 (see fp_direct_coords()) */
++               fp->temp_dst[dst->Index][c] = c;
++               fp->claimed[c] = 3;
++               continue;
++            }
+             fp->temp_dst[dst->Index][c] = (live_after[n + 1][dst->Index] & (1 << c)) ?
+                                          (fp->texture_rows ? (2 + c / 2) | TEMP_FX10 | (c % 2 ? TEMP_HIGH : 0) :
                                            allocate_scalar(fp, kind)) : 31;
           }
        }
@@ -1144,7 +1490,7 @@ index 0149b33..6fc5660 100644
           fprintf(stderr, "ALLOC %u opcode %u", n, inst->Instruction.Opcode);
           for (unsigned src = 0; src < inst->Instruction.NumSrcRegs; src++) {
              const struct tgsi_src_register *operand = &inst->Src[src].Register;
-@@ -810,6 +1348,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -810,6 +1652,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
           fprintf(stderr, "\n");
        }
        emit_tgsi_instr(fp, inst);
@@ -1153,7 +1499,12 @@ index 0149b33..6fc5660 100644
        memset(fp->occupied, 0, sizeof(fp->occupied));
        for (unsigned t = 0; t < fp->num_temporaries; t++) {
           for (unsigned c = 0; c < 4; c++) {
-@@ -832,3 +1372,288 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+@@ -828,7 +1672,303 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+       }
+       memset(fp->temp_src[fp->num_temporaries], -1, sizeof(fp->temp_src[0]));
+    }
++   free(direct);
+    free(live_after);
     util_dynarray_fini(&instructions);
  
  }
@@ -1225,11 +1576,17 @@ index 0149b33..6fc5660 100644
 + * dependent packets through alu0-3. Does packet B read anything packet A
 + * wrote? */
 +static bool
++fp_alu_slot_empty(const struct fp_alu_instr *slot);
++
++static bool
 +fp_alu_hazard(const struct fp_alu_instr_packet *a, const struct fp_alu_instr_packet *b)
 +{
 +   uint8_t conditions = 0;
 +   uint64_t written = fp_alu_writes(a, &conditions);
 +   for (unsigned k = 0; k < 4; k++) {
++      /* an unused slot (all zero) reads "r0" but stores nothing */
++      if (fp_alu_slot_empty(&b->slots[k]))
++         continue;
 +      for (unsigned j = 0; j < 4; j++) {
 +         unsigned index = b->slots[k].src[j].index;
 +         if (index < 24 && (written & (1ull << index)))
@@ -1270,6 +1627,8 @@ index 0149b33..6fc5660 100644
 +   /* check everything first, then rewrite */
 +   for (unsigned pass = 0; pass < 2; pass++) {
 +      for (unsigned k = 0; k < 4; k++) {
++         if (fp_alu_slot_empty(&b->slots[k]))
++            continue;
 +         for (unsigned j = 0; j < 4; j++) {
 +            struct fp_alu_src_operand *src = &b->slots[k].src[j];
 +            if (src->index >= 64 && src->index < 72 && (conditions & (1 << (src->index - 64))))
@@ -1408,8 +1767,10 @@ index 0149b33..6fc5660 100644
 +            bool hazard = na && fp_alu_hazard(last, first);
 +            if (hazard && na + nb <= 3 && fp_alu_forward(last, first))
 +               hazard = false;
++            /* (only an inserted nop packet can overflow the program memory;
++             * the unmerged list may well be longer than what fits) */
 +            if (na + nb + hazard <= 3 &&
-+                list_length(&fp->alu_instructions) + hazard < 64) {
++                (!hazard || list_length(&fp->alu_instructions) < 64)) {
 +               if (hazard) {
 +                  /* Separate the dependent packets by a nop packet. */
 +                  struct fp_alu_instr_packet *nop = fp_alu_nop_packet();
@@ -1512,16 +1873,16 @@ index 8b89318..ee07b8f 100644
  
  int grate_bo_export(struct grate_bo *bo, uint32_t flags);
 diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
-index d8db768..2219115 100644
+index d8db768..6e18b3b 100644
 --- a/src/gallium/drivers/grate/grate_compiler.h
 +++ b/src/gallium/drivers/grate/grate_compiler.h
-@@ -23,6 +23,35 @@ struct grate_vp_shader {
+@@ -23,13 +23,51 @@ struct grate_vp_shader {
     uint16_t output_mask;
     uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* raw 32-bit words, slot i of the immediates */
     unsigned num_immediates;
 +   bool failed; /* shader uses something the compiler cannot emit */
-+};
-+
+ };
+ 
 +/* Fragment "preamble": instructions that only depend on uniforms and
 + * immediates are taken out of the per-pixel program and evaluated on the CPU
 + * when the constants are uploaded (grate_fp_eval_preamble()). Their results
@@ -1548,15 +1909,39 @@ index d8db768..2219115 100644
 +   uint8_t opcode, write_mask, dst, num_srcs;
 +   bool saturate;
 +   struct grate_fp_pre_src src[3];
- };
- 
++};
++
++#define GRATE_FP_SCALE_NONE 0
++#define GRATE_FP_SCALE_DIV  1
++#define GRATE_FP_SCALE_MUL  2
++
  struct grate_fp_info {
-@@ -38,12 +67,17 @@ struct grate_fp_info {
+    struct {
+       uint32_t src;
+       uint32_t dst;
++      int8_t tgsi_in; /* TGSI input this row exports (in_sem_*), see grate_fp_link_src() */
+    } inputs[16];
++   /* Semantic of TGSI input i. The linker instruction of a row takes the
++    * vertex output with the same semantic (emit_program()); a POSITION input
++    * (gl_FragCoord) takes the vertex shader's window-position export. */
++   uint8_t in_sem_name[16], in_sem_index[16];
+    int num_inputs;
+    int color_input;
+    int max_tram_row;
+@@ -38,12 +76,25 @@ struct grate_fp_info {
     struct {
        int word; /* -1 for an immediate */
        float immediate;
-+      /* two FX10 halves (low: word, high: word + 1), see fp->pack_colors */
++      /* two FX10 halves (low: word, high: word_hi or nothing if < 0), see
++       * fp->pack_colors */
 +      bool fx10;
++      int word_hi;
++      /* GRATE_FP_SCALE_*: packed tap offsets are stored divided by a power
++       * of two chosen per draw, their partners multiplied by it */
++      uint8_t scale;
++      /* fx10: the rounding error goes into the next such half, so that the
++       * sum of the packed kernel weights is kept */
++      bool diffuse;
     } constants[32];
     unsigned num_constants;
 +   struct grate_fp_pre_op pre[GRATE_FP_PRE_MAX_OPS];
@@ -1570,7 +1955,7 @@ index d8db768..2219115 100644
  
  struct grate_fp_shader {
     unsigned num_temporaries;
-@@ -54,6 +88,8 @@ struct grate_fp_shader {
+@@ -54,6 +105,8 @@ struct grate_fp_shader {
     uint8_t occupied[72];
     uint8_t claimed[72];
     uint8_t reusable[72];
@@ -1579,7 +1964,7 @@ index d8db768..2219115 100644
     bool late_rows;
     bool texture_rows;
     bool allocation_failed;
-@@ -63,12 +99,62 @@ struct grate_fp_shader {
+@@ -63,12 +116,82 @@ struct grate_fp_shader {
     struct list_head alu_instructions;
     struct list_head mfu_instructions;
     struct grate_fp_info info;
@@ -1597,8 +1982,17 @@ index d8db768..2219115 100644
 +   unsigned num_pack_candidates;
 +   bool constants_overflow; /* rejected for needing more than 32 constants */
 +   bool scheduled; /* grate_fp_schedule() reordered the program */
++   bool reassociated; /* grate_fp_reassociate() rewrote texture coordinates */
 +   unsigned num_packed;
 +   int packed[16]; /* TGSI constant indices (incl. preamble slots) */
++   /* Pack levels beyond the colours (fp_choose_packed()): scalar constant
++    * words stored two per register as FX10 halves, in order of first use.
++    * [0]: the factors of GRATE_FP_KEEP_PRODUCT MADs (blur tap offsets),
++    *      block-scaled (GRATE_FP_SCALE_DIV, their partners _MUL);
++    * [1]: words that only multiply texture samples (kernel weights). */
++   unsigned num_spack[2];
++   int spack[2][32];
++   const struct tgsi_src_register *scale_operand; /* being emitted: reads * scale */
  };
  
  void
@@ -1610,7 +2004,7 @@ index d8db768..2219115 100644
 +void
 +grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
 +                 unsigned rows, bool quiet, bool hoist, unsigned pack_colors,
-+                 unsigned schedule);
++                 unsigned schedule, bool reassoc);
 +
 +struct tgsi_full_instruction;
 +
@@ -1636,6 +2030,17 @@ index d8db768..2219115 100644
 +void
 +grate_fp_fold_preamble(struct grate_fp_shader *fp);
 +
++/* Marks a MAD whose uniform product must stay in the program (two shared
++ * constant words) instead of becoming one preamble word per instruction;
++ * the spare bit of the instruction token, set by grate_fp_reassociate(). */
++#define GRATE_FP_KEEP_PRODUCT(inst) ((inst)->Instruction.Padding)
++
++/* Rewrites texture coordinates that are affine in varyings with a factor
++ * shared by several lookups (blur taps) as factor * E + base (fp/reassoc.c).
++ * Returns true if it changed the program. */
++bool
++grate_fp_reassociate(struct grate_fp_shader *fp, struct util_dynarray *instructions);
++
 +/* results: GRATE_FP_PRE_MAX_SLOTS * 4 floats */
  void
 -grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi);
@@ -1644,7 +2049,7 @@ index d8db768..2219115 100644
  
  #endif
 diff --git a/src/gallium/drivers/grate/grate_context.c b/src/gallium/drivers/grate/grate_context.c
-index 6322cb0..3228acb 100644
+index 6322cb0..b6bee3e 100644
 --- a/src/gallium/drivers/grate/grate_context.c
 +++ b/src/gallium/drivers/grate/grate_context.c
 @@ -13,6 +13,7 @@
@@ -1688,7 +2093,7 @@ index 6322cb0..3228acb 100644
     for (unsigned i = 0; i < 16; i++)
        pipe_sampler_view_reference(&context->sampler_views[i], NULL);
  
-@@ -91,9 +112,18 @@ grate_context_flush(struct pipe_context *pcontext,
+@@ -91,14 +112,25 @@ grate_context_flush(struct pipe_context *pcontext,
                      enum pipe_flush_flags flags)
  {
     struct grate_context *context = grate_context(pcontext);
@@ -1706,13 +2111,26 @@ index 6322cb0..3228acb 100644
 +   }
     if (err)
        grate_loge("context drain failed: %d\n", err);
-    /* Work is complete on return; there is no outstanding pipe fence. */
+-   /* Work is complete on return; there is no outstanding pipe fence. */
++   /* Work is complete on return (both channels drained), so hand out the
++    * shared always-signalled fence. A NULL fence makes EGL fail
++    * eglCreateSyncKHR with EGL_BAD_ALLOC (Smithay creates one per frame). */
+    if (pfence)
+-      *pfence = NULL;
++      *pfence = grate_signalled_fence();
+ }
+ 
+ struct pipe_context *
 diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
-index f22838e..2eb6a26 100644
+index f22838e..6a5df01 100644
 --- a/src/gallium/drivers/grate/grate_context.h
 +++ b/src/gallium/drivers/grate/grate_context.h
-@@ -20,6 +20,8 @@ struct grate_framebuffer_state {
+@@ -18,8 +18,12 @@ struct grate_framebuffer_state {
+    struct grate_bo *rt_bos[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
+    uint32_t rt_params[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
     uint32_t rt_mask;
++   /* A colour target is a shared (imported/exported) resource. */
++   bool rt_shared;
  };
  
 +struct grate_fs_blend_variant;
@@ -1720,7 +2138,7 @@ index f22838e..2eb6a26 100644
  struct grate_channel {
     struct grate_context *context;
     struct grate_stream stream;
-@@ -40,7 +42,10 @@ struct grate_context {
+@@ -40,7 +44,10 @@ struct grate_context {
     struct grate_vertexbuf_state vbs;
     struct pipe_constant_buffer constant_buffer[PIPE_MAX_CONSTANT_BUFFERS]; // ??, stolen from other drivers but no idea
  
@@ -1732,12 +2150,13 @@ index f22838e..2eb6a26 100644
  
     struct grate_zsa_state *zsa;
     struct grate_rasterizer_state *rast;
-@@ -52,9 +57,14 @@ struct grate_context {
+@@ -52,9 +59,15 @@ struct grate_context {
     struct pipe_sampler_state *samplers[16];
  
     uint32_t no_scissor[3];
 +   struct pipe_scissor_state scissor; /* used when rast->base.scissor */
     uint32_t viewport[10];
++   float wpos_viewport[4]; /* scale x, y, translate x, y in pixels (gl_FragCoord export) */
     uint32_t guardband[4];
     bool y_invert;
 +
@@ -1747,7 +2166,7 @@ index f22838e..2eb6a26 100644
  };
  
  static inline struct grate_context *
-@@ -63,6 +73,18 @@ grate_context(struct pipe_context *context)
+@@ -63,6 +76,21 @@ grate_context(struct pipe_context *context)
     return (struct grate_context *)context;
  }
  
@@ -1763,11 +2182,14 @@ index f22838e..2eb6a26 100644
 +void
 +grate_context_submit_3d_bo(struct grate_context *context, struct grate_bo *bo);
 +
++struct pipe_fence_handle *
++grate_signalled_fence(void);
++
  struct pipe_context *
  grate_screen_context_create(struct pipe_screen *pscreen,
                              void *priv, unsigned flags);
 diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
-index 18a61d5..0dccff8 100644
+index 18a61d5..08dabaa 100644
 --- a/src/gallium/drivers/grate/grate_draw.c
 +++ b/src/gallium/drivers/grate/grate_draw.c
 @@ -1,10 +1,13 @@
@@ -1792,7 +2214,7 @@ index 18a61d5..0dccff8 100644
  
  #include "host1x01_hardware.h"
  
-@@ -302,6 +306,138 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
+@@ -302,6 +306,203 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
     return 0;
  }
  
@@ -1856,6 +2278,71 @@ index 18a61d5..0dccff8 100644
 +         draws = 0;
 +   }
 +   return draws;
++}
++
++/* GRATE_BATCH_LAZY=1 (debug): check the GRATE_BATCH_DRAWS limit when the
++ * next draw starts instead of right after the draw, so even with
++ * GRATE_BATCH_DRAWS=1 the job stays unsubmitted until the next draw, map,
++ * flush or framebuffer change. Separates "draws stay pending" from "several
++ * draws share one job" when bisecting batching bugs. */
++static bool
++grate_batch_lazy(void)
++{
++   static int lazy = -1;
++   if (lazy < 0) {
++      const char *env = getenv("GRATE_BATCH_LAZY");
++      lazy = env ? atoi(env) : 0;
++   }
++   return lazy;
++}
++
++/* GRATE_SHARED_SUBMIT=0 (debug): leave draws into shared buffers batched.
++ *
++ * A draw whose colour target is an imported or exported buffer (a dmabuf a
++ * compositor will sample, a scanout buffer) is submitted right after the
++ * draw, like GRATE_BATCH=0; private targets (raster tiles, FBO textures)
++ * keep batching. Chromium's Wayland path (GbmSurfacelessWayland, VSCodium)
++ * renders into its dmabufs and commits them to the compositor without any
++ * glFlush, fence or framebuffer change (0 flushes/s measured, notes/13): the
++ * frame's last draws stayed in the unsubmitted job until the next frame's
++ * first draw, so the compositor showed each buffer's previous content for a
++ * frame ("icons popping in and out"). Submitting (not waiting) is enough:
++ * the kernel runs gr3d jobs in submission order across processes. */
++static bool
++grate_shared_submit(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = getenv("GRATE_SHARED_SUBMIT");
++      on = env ? atoi(env) : 1;
++   }
++   return on;
++}
++
++/* GRATE_DRAW_WAIT=0 (debug): no barrier between the draws of one job.
++ *
++ * The 3D unit does not latch the per-draw state (fragment constants at
++ * 0x820, texture descriptors, the fragment program) at draw start: the next
++ * draw's register writes reach it while the previous draw's fragments are
++ * still in the pipeline, which then finish with the new state. In Chromium
++ * that was missing glyphs (a glyph quad sampling the next draw's texture),
++ * wrong colours and broken icons, only with several draws per job
++ * (GRATE_BATCH_DRAWS=2 broke, =1 with lazy submit did not; notes/13).
++ * Between jobs the kernel waits for the previous job, which hid it with
++ * GRATE_BATCH=0. So each draw after the first in a job first waits, in the
++ * command stream, for the previous draw's OP_DONE increment (pushed by
++ * grate_stream_end): host1x class WAIT_SYNCPT with threshold 0, which the
++ * kernel's command parser patches to the job's last increment (as
++ * opentegra's per-draw barrier), then back to the gr3d class. */
++static bool
++grate_draw_wait(void)
++{
++   static int wait = -1;
++   if (wait < 0) {
++      const char *env = getenv("GRATE_DRAW_WAIT");
++      wait = env ? atoi(env) : 1;
++   }
++   return wait;
 +}
 +
 +static double
@@ -1931,7 +2418,7 @@ index 18a61d5..0dccff8 100644
  static void
  grate_draw_vbo(struct pipe_context *pcontext,
                 const struct pipe_draw_info *info,
-@@ -324,39 +460,84 @@ grate_draw_vbo(struct pipe_context *pcontext,
+@@ -324,39 +525,93 @@ grate_draw_vbo(struct pipe_context *pcontext,
     if (!indirect && (!draws[0].count || !info->instance_count))
        return;
  
@@ -1966,6 +2453,7 @@ index 18a61d5..0dccff8 100644
 +   const double now = age ? grate_perf_now() : 0;
 +   if (stream->status != GRATE_STREAM_FREE &&
 +       (!batch || grate_stream_words(stream) > GRATE_BATCH_MAX_WORDS ||
++        (grate_batch_lazy() && grate_batch_draws() && context->batch_draws >= grate_batch_draws()) ||
 +        grate_stream_relocs(stream) + relocs > GRATE_BATCH_MAX_RELOCS ||
 +        (gpu_limit && context->batch_gpu + gpu > gpu_limit) ||
 +        (age && now - context->batch_t0 >= age))) {
@@ -1992,6 +2480,14 @@ index 18a61d5..0dccff8 100644
        return;
     }
  
++   if (!new_job && grate_draw_wait()) {
++      /* see grate_draw_wait(); 0x8 = host1x class WAIT_SYNCPT, data 0 =
++       * DRM_TEGRA_WAIT_FOR_LAST_SYNCPT_INCR (patched by the kernel) */
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_setclass(0x01, 0x8, 1));
++      GRATE_PUSHBUF_WORD(ptr, 0);
++      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_setclass(0x60, 0, 0));
++   }
++
     /*
 -    * The state needs to be re-initialized on each draw since tegra doesn't
 +    * The state needs to be re-initialized on each job since tegra doesn't
@@ -2031,7 +2527,7 @@ index 18a61d5..0dccff8 100644
     } else
        offset = draws->start;
  
-@@ -407,8 +588,9 @@ grate_draw_vbo(struct pipe_context *pcontext,
+@@ -407,8 +662,9 @@ grate_draw_vbo(struct pipe_context *pcontext,
     GRATE_PUSHBUF_WORD(ptr, value);
     
     err = grate_stream_push_sync_cond(stream, &ptr, DRM_TEGRA_SYNC_COND_RD_DONE);
@@ -2043,7 +2539,7 @@ index 18a61d5..0dccff8 100644
        return;
     }
  
-@@ -419,12 +601,42 @@ grate_draw_vbo(struct pipe_context *pcontext,
+@@ -419,12 +675,43 @@ grate_draw_vbo(struct pipe_context *pcontext,
     GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_IDX_DRAW_PRIM, 1));
     GRATE_PUSHBUF_WORD(ptr, value);
  
@@ -2084,28 +2580,41 @@ index 18a61d5..0dccff8 100644
 +   } else if (!batch) {
 +      err = grate_stream_flush(stream, false);
 +   }
-+   if (batch && grate_batch_draws() && context->batch_draws >= grate_batch_draws() &&
-+       stream->status == GRATE_STREAM_READY)
++   if (batch && stream->status == GRATE_STREAM_READY &&
++       ((context->framebuffer.rt_shared && grate_shared_submit()) ||
++        (!grate_batch_lazy() && grate_batch_draws() && context->batch_draws >= grate_batch_draws())))
 +      grate_context_submit_3d(context);
     if (err < 0)
        grate_loge("grate_stream_flush() failed: %d\n", err);
  }
 diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
-index 0959773..0a1833d 100644
+index 0959773..3c2691e 100644
 --- a/src/gallium/drivers/grate/grate_program.c
 +++ b/src/gallium/drivers/grate/grate_program.c
-@@ -3,7 +3,9 @@
+@@ -1,9 +1,15 @@
++#include <inttypes.h>
+ #include <stdio.h>
+ #include <string.h>
  
  #include "util/u_dynarray.h"
  #include "util/u_memory.h"
 +#include "util/u_debug.h"
++#define XXH_INLINE_ALL
++#include "util/xxhash.h"
  
 +#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
  #include "nir/nir_to_tgsi.h"
  
  #include "tgsi/tgsi_dump.h"
-@@ -26,6 +28,38 @@ struct grate_vs_tgsi_transform_context {
+@@ -24,8 +30,44 @@
+ struct grate_vs_tgsi_transform_context {
+    struct tgsi_transform_context base;
     unsigned next_temp;
++   /* gl_FragCoord export, see grate_vertex_shader_state.wpos_out */
++   int pos_out;  /* POSITION output, -1: no export */
++   int wpos_out, wpos_imm;
++   unsigned pos_temp;
  };
  
 +/* A temporary as a source, swizzle -1 = .xyzw, else replicated. */
@@ -2143,11 +2652,23 @@ index 0959773..0a1833d 100644
  static void
  grate_vs_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
                                      struct tgsi_full_instruction *inst)
-@@ -33,43 +67,82 @@ grate_vs_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
+@@ -33,54 +75,306 @@ grate_vs_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
     struct grate_vs_tgsi_transform_context *gctx =
        (struct grate_vs_tgsi_transform_context *)ctx;
  
 -   int const_index = -1;
++   /* The position is collected in a temporary: the epilog writes it to the
++    * POSITION output and derives the window-position export from it. */
++   if (gctx->pos_out >= 0) {
++      for (unsigned i = 0; i < inst->Instruction.NumDstRegs; i++) {
++         struct tgsi_dst_register *reg = &inst->Dst[i].Register;
++         if (reg->File == TGSI_FILE_OUTPUT && reg->Index == gctx->pos_out) {
++            reg->File = TGSI_FILE_TEMPORARY;
++            reg->Index = gctx->pos_temp;
++         }
++      }
++   }
++
 +   /* A vertex instruction has one constant fetch index (the constant bank
 +    * holds the immediates and the uniforms) and one attribute fetch index.
 +    * Copy every further distinct constant/immediate or attribute operand to a
@@ -2240,22 +2761,213 @@ index 0959773..0a1833d 100644
 +   default:
 +      ctx->emit_instruction(ctx, inst);
 +   }
++}
++
++/* Semantic of the window-position export (no GL varying uses it). */
++#define GRATE_WPOS_SEMANTIC_INDEX 0x7f
++
++static void
++grate_vs_tgsi_transform_prolog(struct tgsi_transform_context *ctx)
++{
++   struct grate_vs_tgsi_transform_context *gctx =
++      (struct grate_vs_tgsi_transform_context *)ctx;
++   if (gctx->pos_out < 0)
++      return;
++   tgsi_transform_temp_decl(ctx, gctx->pos_temp);
++   tgsi_transform_temp_decl(ctx, gctx->pos_temp + 1);
++   tgsi_transform_output_decl(ctx, gctx->wpos_out, TGSI_SEMANTIC_GENERIC,
++                              GRATE_WPOS_SEMANTIC_INDEX, TGSI_INTERPOLATE_PERSPECTIVE);
++   /* placeholder: emit_vs_uniforms() uploads the viewport in this slot */
++   tgsi_transform_immediate_decl(ctx, 0.0f, 0.0f, 0.0f, 0.0f);
++}
++
++/* gl_FragCoord: the hardware gives the fragment program no pixel position,
++ * so the vertex program exports one as a varying. With the viewport scale s
++ * and translation t, window x = x_clip / w * s + t. The export holds
++ * window xy * w (= x_clip * s + t * w), clip z and w: perspective-correct
++ * interpolation then yields window xy * w and w at the pixel, and the
++ * fragment program divides (grate_fs_tgsi_transform()). Exact for w = 1. */
++static void
++grate_vs_tgsi_transform_epilog(struct tgsi_transform_context *ctx)
++{
++   struct grate_vs_tgsi_transform_context *gctx =
++      (struct grate_vs_tgsi_transform_context *)ctx;
++   if (gctx->pos_out < 0)
++      return;
++   const unsigned pos = gctx->pos_temp, t = gctx->pos_temp + 1;
++   struct tgsi_full_src_register srcs[3];
++
++   srcs[0] = grate_vs_temp_src(pos, -1);
++   grate_vs_emit(ctx, TGSI_OPCODE_MOV, TGSI_FILE_OUTPUT, gctx->pos_out, TGSI_WRITEMASK_XYZW,
++                 false, srcs, 1);
++
++   struct tgsi_full_src_register imm = {};
++   imm.Register.File = TGSI_FILE_IMMEDIATE;
++   imm.Register.Index = gctx->wpos_imm;
++   imm.Register.SwizzleX = TGSI_SWIZZLE_X;
++   imm.Register.SwizzleY = TGSI_SWIZZLE_Y;
++   imm.Register.SwizzleZ = TGSI_SWIZZLE_X;
++   imm.Register.SwizzleW = TGSI_SWIZZLE_Y;
++   srcs[0] = grate_vs_temp_src(pos, -1);
++   srcs[1] = imm;
++   grate_vs_emit(ctx, TGSI_OPCODE_MUL, TGSI_FILE_TEMPORARY, t, TGSI_WRITEMASK_XY, false, srcs, 2);
++
++   imm.Register.SwizzleX = imm.Register.SwizzleZ = TGSI_SWIZZLE_Z;
++   imm.Register.SwizzleY = imm.Register.SwizzleW = TGSI_SWIZZLE_W;
++   srcs[0] = grate_vs_temp_src(pos, TGSI_SWIZZLE_W);
++   srcs[1] = imm;
++   srcs[2] = grate_vs_temp_src(t, -1);
++   grate_vs_emit(ctx, TGSI_OPCODE_MAD, TGSI_FILE_OUTPUT, gctx->wpos_out, TGSI_WRITEMASK_XY,
++                 false, srcs, 3);
++
++   srcs[0] = grate_vs_temp_src(pos, -1);
++   grate_vs_emit(ctx, TGSI_OPCODE_MOV, TGSI_FILE_OUTPUT, gctx->wpos_out, TGSI_WRITEMASK_ZW,
++                 false, srcs, 1);
  }
  
  static struct tgsi_token *
- grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
+-grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
++grate_vs_tgsi_transform(const struct tgsi_token *tokens_in, struct grate_vertex_shader_state *so)
  {
     grate_trace();
 -   const unsigned new_len = tgsi_num_tokens(tokens_in) + 100;
-+   /* room for the operand copies and the DP2/CMP expansions */
-+   const unsigned new_len = tgsi_num_tokens(tokens_in) * 4 + 100;
++   /* room for the operand copies, the DP2/CMP expansions and the epilog */
++   const unsigned new_len = tgsi_num_tokens(tokens_in) * 4 + 200;
  
     struct tgsi_shader_info info;
     tgsi_scan_shader(tokens_in, &info);
-@@ -82,6 +155,22 @@ grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
+ 
+    struct grate_vs_tgsi_transform_context ctx = {};
+    ctx.base.transform_instruction = grate_vs_tgsi_transform_instruction;
++   ctx.base.prolog = grate_vs_tgsi_transform_prolog;
++   ctx.base.epilog = grate_vs_tgsi_transform_epilog;
+    ctx.next_temp = info.file_max[TGSI_FILE_TEMPORARY] + 1;
+ 
++   so->num_outputs = MIN2(info.num_outputs, 16);
++   so->wpos_out = so->wpos_imm = ctx.pos_out = -1;
++   int pos_out = -1;
++   for (unsigned i = 0; i < so->num_outputs; i++) {
++      so->out_sem_name[i] = info.output_semantic_name[i];
++      so->out_sem_index[i] = info.output_semantic_index[i];
++      if (info.output_semantic_name[i] == TGSI_SEMANTIC_POSITION)
++         pos_out = i;
++   }
++   static int wpos = -1;
++   if (wpos < 0)
++      wpos = debug_get_bool_option("GRATE_WPOS", true);
++   if (wpos && pos_out >= 0 && info.num_outputs < 16 &&
++       info.immediate_count < GRATE_VP_MAX_IMMEDIATES) {
++      ctx.pos_out = pos_out;
++      ctx.pos_temp = ctx.next_temp;
++      ctx.next_temp += 2;
++      so->wpos_out = ctx.wpos_out = info.num_outputs;
++      so->wpos_imm = ctx.wpos_imm = info.immediate_count;
++      so->out_sem_name[so->wpos_out] = TGSI_SEMANTIC_GENERIC;
++      so->out_sem_index[so->wpos_out] = GRATE_WPOS_SEMANTIC_INDEX;
++      so->num_outputs++;
++   }
++
+    return tgsi_transform_shader(tokens_in, new_len, &ctx.base);
  }
  
- 
++struct grate_fs_tgsi_transform_context {
++   struct tgsi_transform_context base;
++   int pos_in;         /* POSITION input */
++   unsigned usage;     /* components of it the program reads */
++   unsigned temp;      /* gl_FragCoord (temp + 1: scratch) */
++   unsigned imm;       /* 0.5 */
++};
++
++/* gl_FragCoord from the vertex program's export (see
++ * grate_vs_tgsi_transform_epilog()): xy = export.xy / export.w,
++ * z = export.z / export.w * 0.5 + 0.5 (default depth range), w = 1 / export.w. */
++static void
++grate_fs_tgsi_transform_prolog(struct tgsi_transform_context *ctx)
++{
++   struct grate_fs_tgsi_transform_context *gctx =
++      (struct grate_fs_tgsi_transform_context *)ctx;
++   const unsigned t = gctx->temp, r = gctx->temp + 1;
++   const unsigned xyz = gctx->usage & TGSI_WRITEMASK_XYZ;
++
++   tgsi_transform_temp_decl(ctx, t);
++   tgsi_transform_temp_decl(ctx, r);
++   if (gctx->usage & TGSI_WRITEMASK_Z)
++      tgsi_transform_immediate_decl(ctx, 0.5f, 0.5f, 0.5f, 0.5f);
++
++   tgsi_transform_op1_inst(ctx, TGSI_OPCODE_MOV, TGSI_FILE_TEMPORARY, t,
++                           xyz | TGSI_WRITEMASK_W, TGSI_FILE_INPUT, gctx->pos_in);
++   tgsi_transform_op1_swz_inst(ctx, TGSI_OPCODE_RCP, TGSI_FILE_TEMPORARY, r, TGSI_WRITEMASK_X,
++                               TGSI_FILE_TEMPORARY, t, TGSI_SWIZZLE_W);
++   if (xyz) {
++      struct tgsi_full_instruction inst = tgsi_default_full_instruction();
++      inst.Instruction.Opcode = TGSI_OPCODE_MUL;
++      inst.Instruction.NumDstRegs = 1;
++      inst.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++      inst.Dst[0].Register.Index = t;
++      inst.Dst[0].Register.WriteMask = xyz;
++      inst.Instruction.NumSrcRegs = 2;
++      inst.Src[0] = grate_vs_temp_src(t, -1);
++      inst.Src[1] = grate_vs_temp_src(r, TGSI_SWIZZLE_X);
++      ctx->emit_instruction(ctx, &inst);
++   }
++   if (gctx->usage & TGSI_WRITEMASK_Z) {
++      struct tgsi_full_instruction inst = tgsi_default_full_instruction();
++      inst.Instruction.Opcode = TGSI_OPCODE_MAD;
++      inst.Instruction.NumDstRegs = 1;
++      inst.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++      inst.Dst[0].Register.Index = t;
++      inst.Dst[0].Register.WriteMask = TGSI_WRITEMASK_Z;
++      inst.Instruction.NumSrcRegs = 3;
++      inst.Src[0] = grate_vs_temp_src(t, TGSI_SWIZZLE_Z);
++      inst.Src[1].Register.File = TGSI_FILE_IMMEDIATE;
++      inst.Src[1].Register.Index = gctx->imm;
++      inst.Src[2] = inst.Src[1];
++      ctx->emit_instruction(ctx, &inst);
++   }
++   if (gctx->usage & TGSI_WRITEMASK_W)
++      tgsi_transform_op1_swz_inst(ctx, TGSI_OPCODE_MOV, TGSI_FILE_TEMPORARY, t, TGSI_WRITEMASK_W,
++                                  TGSI_FILE_TEMPORARY, r, TGSI_SWIZZLE_X);
++}
++
++static void
++grate_fs_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
++                                    struct tgsi_full_instruction *inst)
++{
++   struct grate_fs_tgsi_transform_context *gctx =
++      (struct grate_fs_tgsi_transform_context *)ctx;
++   for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
++      struct tgsi_src_register *reg = &inst->Src[i].Register;
++      if (reg->File == TGSI_FILE_INPUT && reg->Index == gctx->pos_in && !reg->Indirect) {
++         reg->File = TGSI_FILE_TEMPORARY;
++         reg->Index = gctx->temp;
++      }
++   }
++   ctx->emit_instruction(ctx, inst);
++}
++
++/* Returns new tokens if the program reads gl_FragCoord, else NULL. */
++static struct tgsi_token *
++grate_fs_tgsi_transform(const struct tgsi_token *tokens_in)
++{
++   struct tgsi_shader_info info;
++   tgsi_scan_shader(tokens_in, &info);
++
++   struct grate_fs_tgsi_transform_context ctx = {};
++   ctx.pos_in = -1;
++   for (unsigned i = 0; i < info.num_inputs; i++)
++      if (info.input_semantic_name[i] == TGSI_SEMANTIC_POSITION)
++         ctx.pos_in = i;
++   if (ctx.pos_in < 0 || !info.input_usage_mask[ctx.pos_in])
++      return NULL;
++   ctx.usage = info.input_usage_mask[ctx.pos_in];
++   ctx.temp = info.file_max[TGSI_FILE_TEMPORARY] + 1;
++   ctx.imm = info.immediate_count;
++   ctx.base.prolog = grate_fs_tgsi_transform_prolog;
++   ctx.base.transform_instruction = grate_fs_tgsi_transform_instruction;
++   return tgsi_transform_shader(tokens_in, tgsi_num_tokens(tokens_in) + 100, &ctx.base);
++}
++
++
 +/* Tell the state tracker why a shader was rejected, so that glLinkProgram
 + * fails (with this in the info log) instead of every draw with the program
 + * being dropped silently. Applications then see the failure and can fall
@@ -2271,15 +2983,16 @@ index 0959773..0a1833d 100644
 +      return;
 +   ((struct pipe_shader_state *)template)->error_message = msg;
 +}
-+
+ 
  static void *
  grate_create_vs_state(struct pipe_context *pcontext,
-                       const struct pipe_shader_state *template)
-@@ -109,8 +198,10 @@ grate_create_vs_state(struct pipe_context *pcontext,
+@@ -108,9 +402,11 @@ grate_create_vs_state(struct pipe_context *pcontext,
+       fprintf(stderr, "\n");
     }
  
-    struct tgsi_token *new_tokens = grate_vs_tgsi_transform(so->base.tokens);
+-   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(so->base.tokens);
 -   if (!new_tokens)
++   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(so->base.tokens, so);
 +   if (!new_tokens) {
 +      grate_report_rejection(template, "VERTEX");
        return NULL;
@@ -2287,7 +3000,7 @@ index 0959773..0a1833d 100644
  
     struct tgsi_parse_context parser;
     unsigned ok = tgsi_parse_init(&parser, new_tokens);
-@@ -118,13 +209,22 @@ grate_create_vs_state(struct pipe_context *pcontext,
+@@ -118,13 +414,22 @@ grate_create_vs_state(struct pipe_context *pcontext,
  
     struct grate_vp_shader vp;
     grate_tgsi_to_vp(&vp, &parser);
@@ -2312,7 +3025,7 @@ index 0959773..0a1833d 100644
        return NULL;
     }
  
-@@ -139,6 +239,8 @@ grate_create_vs_state(struct pipe_context *pcontext,
+@@ -139,6 +444,8 @@ grate_create_vs_state(struct pipe_context *pcontext,
        grate_vp_pack(commands + offset, instr, end_of_program);
        offset += 4;
     }
@@ -2321,7 +3034,7 @@ index 0959773..0a1833d 100644
  
     so->blob.commands = commands;
     so->blob.num_commands = num_commands;
-@@ -163,34 +265,21 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
+@@ -163,34 +470,21 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
     FREE(so);
  }
  
@@ -2367,7 +3080,7 @@ index 0959773..0a1833d 100644
     struct util_dynarray result;
     util_dynarray_init(&result, NULL);
  #define BLEND_PUSH(value) util_dynarray_append_typed(&result, uint32_t, (value))
-@@ -209,23 +298,23 @@ create_premultiplied_blob(const struct grate_shader_blob *source,
+@@ -209,23 +503,23 @@ create_premultiplied_blob(const struct grate_shader_blob *source,
        const uint32_t *values = source->commands + i;
        i += count;
        if (opcode == 1 && reg == REG_TGR3D_PSEQ_COMMAND_EVEN(0) && count == 1) {
@@ -2400,7 +3113,7 @@ index 0959773..0a1833d 100644
           }
        }
        if (bit) {
-@@ -234,7 +323,7 @@ create_premultiplied_blob(const struct grate_shader_blob *source,
+@@ -234,7 +528,7 @@ create_premultiplied_blob(const struct grate_shader_blob *source,
        }
        BLEND_PUSH((command & 0xffff0000) | (count + extra));
        for (unsigned j = 0; j < count; j++) BLEND_PUSH(bit == 64 ? 0 : values[j]);
@@ -2409,7 +3122,7 @@ index 0959773..0a1833d 100644
        if (bit == 1) BLEND_PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
     }
     if (seen != 127) goto fail;
-@@ -248,6 +337,468 @@ fail:
+@@ -248,6 +542,468 @@ fail:
     return false;
  }
  
@@ -2878,7 +3591,7 @@ index 0959773..0a1833d 100644
  static void
  free_fragment_ir(struct grate_fp_shader *fp)
  {
-@@ -268,6 +819,153 @@ free_fragment_ir(struct grate_fp_shader *fp)
+@@ -268,6 +1024,308 @@ free_fragment_ir(struct grate_fp_shader *fp)
     }
  }
  
@@ -2945,6 +3658,8 @@ index 0959773..0a1833d 100644
 +      }
 +      fprintf(stderr, "\n");
 +      for (int i = 0; i < inst->mfu_sched.num_instructions; i++) {
++         if (inst->mfu_sched.address + i >= 64)
++            continue;
 +         struct fp_mfu_instr *m = mfus[inst->mfu_sched.address + i];
 +         fprintf(stderr, "   MFU %s r%u;", sfu_ops[m->sfu.op], m->sfu.reg);
 +         for (unsigned k = 0; k < 4; k++)
@@ -2956,6 +3671,10 @@ index 0959773..0a1833d 100644
 +      if (inst->tex)
 +         fprintf(stderr, "   TEX 0x%08x\n", inst->tex);
 +      for (int i = 0; i < inst->alu_sched.num_instructions; i++) {
++         if (inst->alu_sched.address + i >= 64) {
++            fprintf(stderr, "   ALU packet %d (beyond the program memory)\n", inst->alu_sched.address + i);
++            continue;
++         }
 +         struct fp_alu_instr_packet *a = alus[inst->alu_sched.address + i];
 +         fprintf(stderr, "   ALU packet %d:\n", inst->alu_sched.address + i);
 +         for (unsigned k = 0; k < 4; k++) {
@@ -2996,12 +3715,12 @@ index 0959773..0a1833d 100644
 + * fit). */
 +static void
 +compile_fp_attempt(struct grate_fp_shader *fp, const struct tgsi_token *tokens, unsigned rows,
-+                   bool quiet, bool hoist, unsigned pack, unsigned schedule, bool trials)
++                   bool quiet, bool hoist, unsigned pack, unsigned schedule, bool reassoc, bool trials)
 +{
 +   struct tgsi_parse_context parser;
 +   unsigned ok = tgsi_parse_init(&parser, tokens);
 +   assert(ok == TGSI_PARSE_OK);
-+   grate_tgsi_to_fp(fp, &parser, rows, quiet, hoist, pack, schedule);
++   grate_tgsi_to_fp(fp, &parser, rows, quiet, hoist, pack, schedule, reassoc);
 +   tgsi_parse_free(&parser);
 +   grate_fp_merge_batches(fp);
 +
@@ -3029,10 +3748,159 @@ index 0959773..0a1833d 100644
 +   }
 +}
 +
++/* Compiles with the fewest pixel-packet rows that fit; returns the row
++ * count (fp->allocation_failed if nothing fits). reassoc: with the texture
++ * coordinates reassociated (fp/reassoc.c), preamble attempts only; fails
++ * with fp->reassociated false if that pass has nothing to do. messages: print
++ * the rejection reason of the last attempt. */
++static unsigned
++compile_fp(struct grate_fp_shader *fp, const struct tgsi_token *tokens, bool reassoc, bool messages,
++           bool trials)
++{
++   /* Compile with the fewest pixel-packet rows that fit. More rows give
++    * more per-pixel registers (4 per row) but cost N EXECs per batch.
++    * With NUM_ROWS = N one pass through the pipeline is N consecutive EXECs:
++    * EXEC k of a pass runs its MFU/TEX/PSEQ on row k (as r0-r3), while the
++    * ALU addresses all rows (r0..r4N-1). All work is done in the first EXEC
++    * of a pass (row 0), the other N-1 EXECs are empty (as in
++    * xf86-video-opentegra's EXA shaders). */
++   const unsigned forced = grate_fp_forced_rows();
++   const unsigned first_rows = forced ? forced : 1, last_rows = forced ? forced : 4;
++   /* Each row count first with the uniform-only arithmetic moved to the CPU
++    * (fewer registers and EXECs, but its results take constant slots), then
++    * without. GRATE_FP_HOIST=0 disables the preamble (debugging). */
++   const bool try_hoist = debug_get_bool_option("GRATE_FP_HOIST", true);
++   /* Per row count: preamble; if that needs more than 32 constants, preamble
++    * with the first 1, 2, ... colour constants packed as FX10 pairs (as few as
++    * possible: packing costs precision and sometimes an EXEC); no preamble. */
++   unsigned rows = first_rows;
++   for (;;) {
++      unsigned mode = try_hoist ? 0 : 2, pack = 0;
++      for (;;) {
++         const bool hoist = mode != 2;
++         const bool last = rows == last_rows && mode == 2;
++         /* trial compiles are silent, except with GRATE_DEBUG=tgsi GRATE_FP_TRIALS=1 */
++         const bool quiet = !(last && messages) && !trials;
++         if (trials)
++            fprintf(stderr, "GRATE FRAG: attempt with %u rows%s%s", rows, hoist ? ", preamble" : "",
++                    reassoc ? ", reassociated" : "");
++         if (trials && pack)
++            fprintf(stderr, ", %u packed colour%s", pack, pack > 1 ? "s" : "");
++         if (trials)
++            fprintf(stderr, "\n");
++         /* Program order first, then the schedules (fp/sched.c: they only
++          * estimate register pressure and batch boundaries); a schedule is
++          * kept only if it fits and is shorter. */
++         compile_fp_attempt(fp, tokens, rows, quiet, hoist, pack, 0, reassoc && hoist, trials);
++         /* nothing to reassociate: the caller already has this program */
++         if (reassoc && hoist && !fp->reassociated) {
++            fp->allocation_failed = true;
++            return rows;
++         }
++         for (unsigned schedule = 1; schedule <= GRATE_FP_SCHEDULES; schedule++) {
++            struct grate_fp_shader alt;
++            compile_fp_attempt(&alt, tokens, rows, quiet, hoist, pack, schedule, reassoc && hoist, trials);
++            const bool keep = alt.scheduled && !alt.allocation_failed &&
++               (fp->allocation_failed ||
++                list_length(&alt.fp_instructions) < list_length(&fp->fp_instructions));
++            if (trials && alt.scheduled)
++               fprintf(stderr, "GRATE FRAG: schedule %u %s (%d EXECs): %s\n", schedule,
++                       alt.allocation_failed ? "fails" : "fits", list_length(&alt.fp_instructions),
++                       keep ? "keeping it" : "not kept");
++            if (keep) {
++               /* keeps fp's overflow/pack candidate counts only if both fail */
++               free_fragment_ir(fp);
++               fp_move(fp, &alt);
++            } else {
++               free_fragment_ir(&alt);
++            }
++            if (!alt.scheduled && !keep)
++               break; /* nothing to reorder */
++         }
++         if (!fp->allocation_failed || last)
++            return rows;
++         const bool overflow = fp->constants_overflow;
++         /* pack candidates are only counted when packing */
++         const unsigned candidates = fp->num_pack_candidates;
++         free_fragment_ir(fp);
++         if (mode == 0 && overflow) {
++            mode = 1;
++            pack = 1;
++         } else if (mode == 1 && overflow && pack < candidates && pack < 16) {
++            pack++;
++         } else if (mode < 2 && !reassoc) { /* no preamble */
++            mode = 2;
++            pack = 0;
++         } else {
++            break;
++         }
++      }
++      if (rows == last_rows) {
++         /* reassociated: no attempt without the preamble */
++         fp->allocation_failed = true;
++         fp->reassociated = true;
++         list_inithead(&fp->fp_instructions);
++         list_inithead(&fp->alu_instructions);
++         list_inithead(&fp->mfu_instructions);
++         return rows;
++      }
++      rows++;
++   }
++}
++
++/* grate samples level 0 only (no mipmaps: grate_state.c asserts last_level == 0
++ * and MIPFILTER_NONE), so an LOD bias cannot change the result: texture2D(s, uv,
++ * bias) is texture2D(s, uv). Skia (Chromium) samples with bias -0.475
++ * ("sharpen mipmapped textures") in nearly every textured shader. */
++static bool
++grate_drop_tex_bias(nir_builder *b, nir_tex_instr *tex, void *data)
++{
++   if (tex->op != nir_texop_txb)
++      return false;
++   int idx = nir_tex_instr_src_index(tex, nir_tex_src_bias);
++   if (idx >= 0)
++      nir_tex_instr_remove_src(tex, idx);
++   tex->op = nir_texop_tex;
++   return true;
++}
++
++/* Rejected fragment shaders (struct grate_screen::fs_rejected). The key is
++ * the final TGSI, after the NIR lowering and the gl_FragCoord transform, so
++ * it covers everything compile_fp() sees; the compile options are
++ * environment variables read once per process. GRATE_FP_REJECT_CACHE=0
++ * disables the cache. */
++static uint64_t
++grate_fs_reject_key(const struct tgsi_token *tokens)
++{
++   const unsigned n = tgsi_num_tokens(tokens);
++   const uint64_t key = XXH64(tokens, n * sizeof(*tokens), n);
++   return key ? key : 1; /* 0 marks an empty slot */
++}
++
++static bool
++grate_fs_reject_cached(struct grate_screen *screen, uint64_t key)
++{
++   bool found = false;
++   simple_mtx_lock(&screen->fs_reject_lock);
++   for (unsigned i = 0; i < GRATE_FS_REJECT_CACHE && !found; i++)
++      found = screen->fs_rejected[i] == key;
++   simple_mtx_unlock(&screen->fs_reject_lock);
++   return found;
++}
++
++static void
++grate_fs_reject_add(struct grate_screen *screen, uint64_t key)
++{
++   simple_mtx_lock(&screen->fs_reject_lock);
++   screen->fs_rejected[screen->fs_rejected_next] = key;
++   screen->fs_rejected_next = (screen->fs_rejected_next + 1) % GRATE_FS_REJECT_CACHE;
++   simple_mtx_unlock(&screen->fs_reject_lock);
++}
++
  static void *
  grate_create_fs_state(struct pipe_context *pcontext,
                        const struct pipe_shader_state *template)
-@@ -283,8 +981,18 @@ grate_create_fs_state(struct pipe_context *pcontext,
+@@ -283,30 +1341,100 @@ grate_create_fs_state(struct pipe_context *pcontext,
     so->base = *template;
  
     if (template->type == PIPE_SHADER_IR_NIR) {
@@ -3043,6 +3911,7 @@ index 0959773..0a1833d 100644
 +       * coordinate, see emit_TEX()) */
 +      const nir_lower_tex_options tex_options = {.lower_txp = ~0u};
 +      bool lowered_tex = false;
++      NIR_PASS(lowered_tex, nir, nir_shader_tex_pass, grate_drop_tex_bias, nir_metadata_control_flow, NULL);
 +      NIR_PASS(lowered_tex, nir, nir_lower_tex, &tex_options);
 +      if (lowered_tex)
 +         NIR_PASS(_, nir, nir_opt_algebraic);
@@ -3053,111 +3922,94 @@ index 0959773..0a1833d 100644
        so->base.type = PIPE_SHADER_IR_TGSI;
     }
  
-@@ -295,18 +1003,97 @@ grate_create_fs_state(struct pipe_context *pcontext,
+ 
++   /* gl_FragCoord comes from a varying (tokens_owned: ours to free) */
++   bool tokens_owned = template->type == PIPE_SHADER_IR_NIR;
++   struct tgsi_token *wpos_tokens = grate_fs_tgsi_transform(so->base.tokens);
++   if (wpos_tokens) {
++      if (tokens_owned)
++         FREE((void *)so->base.tokens);
++      so->base.tokens = wpos_tokens;
++      tokens_owned = true;
++   }
++
+    if (grate_debug & GRATE_DEBUG_TGSI) {
+       fprintf(stderr, "DEBUG: TGSI:\n");
+       tgsi_dump(so->base.tokens, 0);
        fprintf(stderr, "\n");
     }
  
 -   struct tgsi_parse_context parser;
 -   unsigned ok = tgsi_parse_init(&parser, so->base.tokens);
 -   assert(ok == TGSI_PARSE_OK);
--
-+   /* Compile with the fewest pixel-packet rows that fit. More rows give
-+    * more per-pixel registers (4 per row) but cost N EXECs per batch.
-+    * With NUM_ROWS = N one pass through the pipeline is N consecutive EXECs:
-+    * EXEC k of a pass runs its MFU/TEX/PSEQ on row k (as r0-r3), while the
-+    * ALU addresses all rows (r0..r4N-1). All work is done in the first EXEC
-+    * of a pass (row 0), the other N-1 EXECs are empty (as in
-+    * xf86-video-opentegra's EXA shaders). */
++   /* Rejected before: fail at once instead of rerunning every trial compile. */
++   struct grate_screen *screen = grate_screen(pcontext->screen);
++   const bool reject_cache = debug_get_bool_option("GRATE_FP_REJECT_CACHE", true);
++   const uint64_t reject_key = reject_cache ? grate_fs_reject_key(so->base.tokens) : 0;
++   if (reject_cache && grate_fs_reject_cached(screen, reject_key)) {
++      fprintf(stderr, "GRATE FRAG: rejected before (TGSI %016" PRIx64 "; shader rejected)\n", reject_key);
++      if (tokens_owned)
++         FREE((void *)so->base.tokens);
++      FREE(so);
++      grate_report_rejection(template, "FRAG");
++      return NULL;
++   }
+ 
++   /* The program as written first; if it does not fit, or is long, also
++    * with the texture coordinates reassociated (fp/reassoc.c: blur taps),
++    * keeping the shorter one. GRATE_FP_REASSOC=0 disables the second. */
     struct grate_fp_shader fp;
 -   grate_tgsi_to_fp(&fp, &parser);
 -   tgsi_parse_free(&parser);
-+   const unsigned forced = grate_fp_forced_rows();
-+   const unsigned first_rows = forced ? forced : 1, last_rows = forced ? forced : 4;
-+   /* Each row count first with the uniform-only arithmetic moved to the CPU
-+    * (fewer registers and EXECs, but its results take constant slots), then
-+    * without. GRATE_FP_HOIST=0 disables the preamble (debugging). */
-+   const bool try_hoist = debug_get_bool_option("GRATE_FP_HOIST", true);
-+   /* Per row count: preamble; if that needs more than 32 constants, preamble
-+    * with the first 1, 2, ... colour constants packed as FX10 pairs (as few as
-+    * possible: packing costs precision and sometimes an EXEC); no preamble. */
 +   const bool trials = (grate_debug & GRATE_DEBUG_TGSI) && debug_get_bool_option("GRATE_FP_TRIALS", false);
-+   unsigned rows = first_rows;
-+   for (;;) {
-+      unsigned mode = try_hoist ? 0 : 2, pack = 0;
-+      for (;;) {
-+         const bool hoist = mode != 2;
-+         const bool last = rows == last_rows && mode == 2;
-+         /* trial compiles are silent, except with GRATE_DEBUG=tgsi GRATE_FP_TRIALS=1 */
-+         const bool quiet = !last && !trials;
-+         if (trials)
-+            fprintf(stderr, "GRATE FRAG: attempt with %u rows%s", rows, hoist ? ", preamble" : "");
-+         if (trials && pack)
-+            fprintf(stderr, ", %u packed colour%s", pack, pack > 1 ? "s" : "");
-+         if (trials)
-+            fprintf(stderr, "\n");
-+         /* Program order first, then the schedules (fp/sched.c: they only
-+          * estimate register pressure and batch boundaries); a schedule is
-+          * kept only if it fits and is shorter. */
-+         compile_fp_attempt(&fp, so->base.tokens, rows, quiet, hoist, pack, 0, trials);
-+         for (unsigned schedule = 1; schedule <= GRATE_FP_SCHEDULES; schedule++) {
-+            struct grate_fp_shader alt;
-+            compile_fp_attempt(&alt, so->base.tokens, rows, quiet, hoist, pack, schedule, trials);
-+            const bool keep = alt.scheduled && !alt.allocation_failed &&
-+               (fp.allocation_failed ||
-+                list_length(&alt.fp_instructions) < list_length(&fp.fp_instructions));
-+            if (trials && alt.scheduled)
-+               fprintf(stderr, "GRATE FRAG: schedule %u %s (%d EXECs): %s\n", schedule,
-+                       alt.allocation_failed ? "fails" : "fits", list_length(&alt.fp_instructions),
-+                       keep ? "keeping it" : "not kept");
-+            if (keep) {
-+               /* keeps fp's overflow/pack candidate counts only if both fail */
-+               free_fragment_ir(&fp);
-+               fp_move(&fp, &alt);
-+            } else {
-+               free_fragment_ir(&alt);
-+            }
-+            if (!alt.scheduled && !keep)
-+               break; /* nothing to reorder */
-+         }
-+         if (!fp.allocation_failed || last)
-+            goto compiled;
-+         const bool overflow = fp.constants_overflow;
-+         /* pack candidates are only counted when packing */
-+         const unsigned candidates = fp.num_pack_candidates;
++   const bool try_reassoc = debug_get_bool_option("GRATE_FP_REASSOC", true);
++   unsigned rows = compile_fp(&fp, so->base.tokens, false, !try_reassoc, trials);
++   if (try_reassoc && (fp.allocation_failed || list_length(&fp.fp_instructions) >= 12)) {
++      struct grate_fp_shader alt;
++      const unsigned alt_rows = compile_fp(&alt, so->base.tokens, true, true, trials);
++      const bool keep = alt.reassociated && !alt.allocation_failed &&
++         (fp.allocation_failed || list_length(&alt.fp_instructions) < list_length(&fp.fp_instructions));
++      if (trials)
++         fprintf(stderr, "GRATE FRAG: reassociated %s (%d EXECs, %u rows): %s\n",
++                 !alt.reassociated ? "is the same" : alt.allocation_failed ? "fails" : "fits",
++                 list_length(&alt.fp_instructions), alt_rows, keep ? "keeping it" : "not kept");
++      if (keep) {
 +         free_fragment_ir(&fp);
-+         if (mode == 0 && overflow) {
-+            mode = 1;
-+            pack = 1;
-+         } else if (mode == 1 && overflow && pack < candidates && pack < 16) {
-+            pack++;
-+         } else if (mode < 2) { /* no preamble */
-+            mode = 2;
-+            pack = 0;
-+         } else {
-+            break;
++         fp_move(&fp, &alt);
++         rows = alt_rows;
++      } else {
++         free_fragment_ir(&alt);
++         if (fp.allocation_failed && !trials) {
++            /* once more for the rejection message */
++            free_fragment_ir(&fp);
++            rows = compile_fp(&fp, so->base.tokens, false, true, false);
 +         }
 +      }
-+      rows++;
 +   }
-+compiled:
 +   if (!fp.allocation_failed && (grate_debug & GRATE_DEBUG_TGSI)) {
 +      fp_dump_program(&fp);
-+      fprintf(stderr, "GRATE FRAG: %u rows, %d EXECs, %d MFU, %d ALU, %u constants, %u preamble ops\n", rows,
++      fprintf(stderr, "GRATE FRAG: %u rows, %d EXECs, %d MFU, %d ALU, %u constants, %u preamble ops%s\n", rows,
 +              list_length(&fp.fp_instructions), list_length(&fp.mfu_instructions),
-+              list_length(&fp.alu_instructions), fp.info.num_constants, fp.info.num_pre);
++              list_length(&fp.alu_instructions), fp.info.num_constants, fp.info.num_pre,
++              fp.reassociated ? ", reassociated" : "");
 +   }
     if (fp.allocation_failed) {
 +      if (grate_debug & GRATE_DEBUG_TGSI)
 +         tgsi_dump(so->base.tokens, 0);
        free_fragment_ir(&fp);
-       if (template->type == PIPE_SHADER_IR_NIR)
+-      if (template->type == PIPE_SHADER_IR_NIR)
++      if (reject_cache) {
++         grate_fs_reject_add(screen, reject_key);
++         fprintf(stderr, "GRATE FRAG: TGSI %016" PRIx64 " remembered as rejected\n", reject_key);
++      }
++      if (tokens_owned)
           FREE((void *)so->base.tokens);
        FREE(so);
 +      grate_report_rejection(template, "FRAG");
        return NULL;
     }
  
-@@ -315,12 +1102,9 @@ grate_create_fs_state(struct pipe_context *pcontext,
+@@ -315,12 +1443,9 @@ grate_create_fs_state(struct pipe_context *pcontext,
  
  #define PUSH(x) util_dynarray_append_typed(&buf, uint32_t, (x))
     PUSH(host1x_opcode_incr(REG_TGR3D_GLOBAL_PIX_ATTR, 1));
@@ -3173,7 +4025,7 @@ index 0959773..0a1833d 100644
     PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_CTL, 1));
     PUSH(0x22000000 | TGR3D_PSEQ_CTL_MAX_OUT(0x12c) |
          TGR3D_PSEQ_CTL_MIN_OUT(0xc8) |
-@@ -416,14 +1200,11 @@ grate_create_fs_state(struct pipe_context *pcontext,
+@@ -416,14 +1541,11 @@ grate_create_fs_state(struct pipe_context *pcontext,
     so->blob.num_commands = buf.size / sizeof(uint32_t);
     so->blob.commands = buf.data;
     so->info = fp.info;
@@ -3192,7 +4044,7 @@ index 0959773..0a1833d 100644
     return so;
  }
  
-@@ -440,7 +1221,8 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+@@ -440,7 +1562,8 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
     struct grate_fragment_shader_state *shader = so;
     grate_trace();
     FREE(shader->blob.commands);
@@ -3203,7 +4055,7 @@ index 0959773..0a1833d 100644
  }
  
 diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
-index c334216..c022ed8 100644
+index c334216..80f7ce4 100644
 --- a/src/gallium/drivers/grate/grate_program.h
 +++ b/src/gallium/drivers/grate/grate_program.h
 @@ -5,6 +5,7 @@
@@ -3214,7 +4066,18 @@ index c334216..c022ed8 100644
  
  struct grate_shader_blob {
     uint32_t *commands;
-@@ -19,13 +20,52 @@ struct grate_vertex_shader_state {
+@@ -15,17 +16,63 @@ struct grate_vertex_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+    uint16_t output_mask;
++   /* Varying linking by semantic (emit_program()): semantic of output i.
++    * wpos_out >= 0: output holding (window x * w, window y * w, clip z, w)
++    * for gl_FragCoord, computed with the viewport in immediate slot wpos_imm
++    * (scale x, scale y, translate x, translate y; emit_vs_uniforms()). */
++   uint8_t out_sem_name[16], out_sem_index[16];
++   unsigned num_outputs;
++   int wpos_out, wpos_imm;
+    uint32_t immediates[GRATE_VP_MAX_IMMEDIATES][4]; /* uploaded with the uniforms, see emit_vs_uniforms() */
     unsigned num_immediates;
  };
  
@@ -3269,7 +4132,7 @@ index c334216..c022ed8 100644
  grate_context_program_init(struct pipe_context *pcontext);
  
 diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
-index e4b46e6..50880bb 100644
+index e4b46e6..d4d96ab 100644
 --- a/src/gallium/drivers/grate/grate_resource.c
 +++ b/src/gallium/drivers/grate/grate_resource.c
 @@ -21,6 +21,7 @@
@@ -3280,16 +4143,17 @@ index e4b46e6..50880bb 100644
  
  
  static bool
-@@ -37,6 +38,8 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
+@@ -37,6 +38,9 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
        return false;
  
     resource = grate_resource(presource);
++   resource->shared = 1;
 +   if (context)
 +      grate_context_submit_3d_bo(grate_context(context), resource->bo);
     if (grate_bo_wait(resource->bo))
        return false;
  
-@@ -92,8 +95,47 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+@@ -92,8 +96,47 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
     if (!ptrans)
        return NULL;
  
@@ -3338,7 +4202,7 @@ index e4b46e6..50880bb 100644
  
     memset(ptrans, 0, sizeof(*ptrans));
  
-@@ -108,7 +150,7 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+@@ -108,7 +151,7 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
  
     return (uint8_t *)ret +
            box->y * resource->pitch +
@@ -3347,7 +4211,7 @@ index e4b46e6..50880bb 100644
  }
  
  static void
-@@ -125,7 +167,15 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
+@@ -125,7 +168,15 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
  {
     struct grate_context *context = grate_context(pcontext);
  
@@ -3364,7 +4228,7 @@ index e4b46e6..50880bb 100644
  
     pipe_resource_reference(&transfer->resource, NULL);
     slab_free(&context->transfer_pool, transfer);
-@@ -150,6 +200,7 @@ grate_pixel_format(enum pipe_format format)
+@@ -150,6 +201,7 @@ grate_pixel_format(enum pipe_format format)
     case PIPE_FORMAT_B4G4R4A4_UNORM:
        return TGR3D_SURF_FORMAT_A4B4G4R4;
     case PIPE_FORMAT_Z16_UNORM:
@@ -3372,7 +4236,7 @@ index e4b46e6..50880bb 100644
        return TGR3D_SURF_FORMAT_Z16;
     case PIPE_FORMAT_B8G8R8A8_UNORM:
     case PIPE_FORMAT_B8G8R8X8_UNORM:
-@@ -180,7 +231,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+@@ -180,7 +232,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
     pipe_reference_init(&resource->b.reference, 1);
     resource->b.screen = pscreen;
  
@@ -3381,7 +4245,7 @@ index e4b46e6..50880bb 100644
     height = template->height0;
  
     resource->tiled = 0;
-@@ -249,6 +300,8 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
+@@ -249,6 +301,8 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
  
     switch (handle->type) {
     case WINSYS_HANDLE_TYPE_FD:
@@ -3390,17 +4254,71 @@ index e4b46e6..50880bb 100644
        resource->bo = grate_bo_import(screen->drm, handle->handle);
        if (!resource->bo) {
           fprintf(stderr, "grate_bo_import() failed\n");
-@@ -315,6 +368,9 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+@@ -262,6 +316,7 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
+       goto fail;
+ 
+    resource->pitch = handle->stride;
++   resource->shared = 1;
+ 
+    format = grate_pixel_format(template->format);
+    if (format < 0) {
+@@ -302,6 +357,35 @@ grate_resource_copy_region(struct pipe_context *pcontext,
+    grate_unimplemented();
+ }
+ 
++/* gr2d copies bytes; formats whose channels differ by more than X vs A
++ * (RGBA <-> BGRA, possible since RGBA8 is a render target too) need a
++ * conversion. Done on the CPU for linear surfaces (maps are linear views of
++ * the BO, see grate_resource_transfer_map). */
++static bool
++grate_blit_needs_convert(enum pipe_format src, enum pipe_format dst)
++{
++   return src != dst && grate_format_cpp(src) == 4 && grate_format_cpp(dst) == 4 &&
++          util_format_rgbx_to_rgba(src) != util_format_rgbx_to_rgba(dst);
++}
++
++static bool
++grate_blit_cpu(struct grate_context *context, struct grate_resource *dst,
++               struct grate_resource *src, const struct pipe_blit_info *info)
++{
++   void *s, *d;
++   if (dst->tiled || src->tiled)
++      return false;
++   grate_context_submit_3d_bo(context, src->bo);
++   grate_context_submit_3d_bo(context, dst->bo);
++   if (grate_bo_map(src->bo, &s) || grate_bo_map(dst->bo, &d))
++      return false;
++   util_format_translate(dst->b.format, d, dst->pitch, info->dst.box.x, info->dst.box.y,
++                         src->b.format, s, src->pitch, info->src.box.x, info->src.box.y,
++                         MIN2(info->src.box.width, info->dst.box.width),
++                         MIN2(info->src.box.height, info->dst.box.height));
++   return true;
++}
++
+ static void
+ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+ {
+@@ -315,6 +399,19 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
     dst = grate_resource(info->dst.resource);
     src = grate_resource(info->src.resource);
  
++   if (grate_blit_needs_convert(src->b.format, dst->b.format)) {
++      if (grate_blit_cpu(context, dst, src, info))
++         return;
++      static bool warned;
++      if (!warned)
++         fprintf(stderr, "GRATE: tiled %s -> %s blit copies bytes (channels not converted)\n",
++                 util_format_short_name(src->b.format), util_format_short_name(dst->b.format));
++      warned = true;
++   }
++
 +   /* gr2d runs on another channel: submit the batched draws first. */
 +   grate_context_submit_3d(context);
 +
     err = grate_stream_begin(&gr2d->stream, &ptr);
     if (err < 0) {
        fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
-@@ -333,7 +389,7 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+@@ -333,7 +430,7 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
      */
  
     value = 1 << 20;
@@ -3409,7 +4327,7 @@ index e4b46e6..50880bb 100644
     case 1:
        value |= 0 << 16;
        break;
-@@ -379,7 +435,15 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+@@ -379,7 +476,15 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
  
     grate_stream_end(&gr2d->stream, &ptr);
  
@@ -3426,7 +4344,7 @@ index e4b46e6..50880bb 100644
  }
  
  static uint32_t
-@@ -461,6 +525,9 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
+@@ -461,6 +566,9 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
  
     fb = &context->framebuffer.base;
  
@@ -3436,7 +4354,7 @@ index e4b46e6..50880bb 100644
     err = grate_stream_begin(stream, &ptr);
     if (err < 0) {
        grate_loge("grate_stream_begin() failed: %d\n", err);
-@@ -484,14 +551,22 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
+@@ -484,14 +592,22 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
           /* TODO: handle the case where both are not set! */
           fill(stream, &ptr, 
                    grate_resource(fb->zsbuf.texture),
@@ -3462,7 +4380,7 @@ index e4b46e6..50880bb 100644
  }
  
  static void
-@@ -507,7 +582,8 @@ grate_clear_render_target(struct pipe_context *pipe,
+@@ -507,7 +623,8 @@ grate_clear_render_target(struct pipe_context *pipe,
     uint32_t *ptr;
     int err;
     assert(!render_condition_enabled);
@@ -3472,7 +4390,7 @@ index e4b46e6..50880bb 100644
     err = grate_stream_begin(stream, &ptr);
     if (err < 0) {
        grate_loge("grate_stream_begin() failed: %d\n", err);
-@@ -539,7 +615,8 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
+@@ -539,7 +656,8 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
     uint32_t *ptr;
     int err;
     assert(!render_condition_enabled);
@@ -3482,7 +4400,7 @@ index e4b46e6..50880bb 100644
     err = grate_stream_begin(stream, &ptr);
     if (err < 0) {
        grate_loge("grate_stream_begin() failed: %d\n", err);
-@@ -548,8 +625,8 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
+@@ -548,8 +666,8 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
     
     fill(&context->gr2d->stream, &ptr,
          grate_resource(dst->texture),
@@ -3493,7 +4411,7 @@ index e4b46e6..50880bb 100644
          dstx, dsty, width, height);
     
     grate_stream_end(stream, &ptr);
-@@ -559,6 +636,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
+@@ -559,6 +677,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
  static void
  grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
  {
@@ -3502,7 +4420,7 @@ index e4b46e6..50880bb 100644
     if (err)
        grate_loge("resource wait failed: %d\n", err);
 diff --git a/src/gallium/drivers/grate/grate_resource.h b/src/gallium/drivers/grate/grate_resource.h
-index 0cd5771..cc2c40d 100644
+index 0cd5771..51c4ed0 100644
 --- a/src/gallium/drivers/grate/grate_resource.h
 +++ b/src/gallium/drivers/grate/grate_resource.h
 @@ -3,6 +3,7 @@
@@ -3513,7 +4431,18 @@ index 0cd5771..cc2c40d 100644
  
  struct grate_resource {
     struct pipe_resource b;
-@@ -21,6 +22,25 @@ grate_resource(struct pipe_resource *resource)
+@@ -10,6 +11,10 @@ struct grate_resource {
+    unsigned int pitch;
+    unsigned int tiled : 1;
+    unsigned int format : 5;
++   /* Imported from or exported as a dmabuf/handle: another process (a
++    * compositor, KMS) can read it without any GL call reaching this driver.
++    * Draws into it are never left unsubmitted (grate_draw.c). */
++   unsigned int shared : 1;
+ };
+ 
+ static inline struct grate_resource *
+@@ -21,6 +26,25 @@ grate_resource(struct pipe_resource *resource)
  int
  grate_pixel_format(enum pipe_format format);
  
@@ -3540,7 +4469,7 @@ index 0cd5771..cc2c40d 100644
  grate_context_resource_init(struct pipe_context *pcontext);
  
 diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
-index eadca7b..23a9d6b 100755
+index eadca7b..6373ac9 100755
 --- a/src/gallium/drivers/grate/grate_screen.c
 +++ b/src/gallium/drivers/grate/grate_screen.c
 @@ -6,6 +6,7 @@
@@ -3551,7 +4480,28 @@ index eadca7b..23a9d6b 100755
  #include "util/hash_table.h"
  #include "util/macros.h"
  #include "util/u_memory.h"
-@@ -328,7 +329,7 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
+@@ -37,6 +38,7 @@ grate_screen_destroy(struct pipe_screen *pscreen)
+    struct grate_screen *screen = grate_screen(pscreen);
+ 
+    slab_destroy_parent(&screen->transfer_pool);
++   simple_mtx_destroy(&screen->fs_reject_lock);
+ 
+    grate_device_close(screen->drm);
+    FREE(screen);
+@@ -237,6 +239,12 @@ grate_screen_init_caps(struct grate_screen *screen)
+    caps->can_bind_const_buffer_as_vertex = false; // TODO: probably
+    caps->allow_mapped_buffers_during_execution = false; // TODO: probably
+    
++   /* gl_FragCoord as exported by the vertex program (grate_program.c):
++    * framebuffer rows counted from the top, pixel centres at .5; the state
++    * tracker converts to what the shader asked for. */
++   caps->fs_coord_origin_upper_left = true;
++   caps->fs_coord_pixel_center_half_integer = true;
++
+    // well, not quite. but perhaps close enough?
+    caps->fragment_shader_texture_lod = true;
+    caps->fragment_shader_derivatives = true;
+@@ -328,7 +336,7 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
     caps->int16 = false;
     caps->glsl_16bit_consts = false;
     caps->glsl_16bit_load_dst = false;
@@ -3560,7 +4510,7 @@ index eadca7b..23a9d6b 100755
     caps->tgsi_any_inout_decl_range = false;
  
     // Fragment Shader caps
-@@ -341,7 +342,11 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
+@@ -341,7 +349,11 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
     caps->max_tex_indirections = 128;
     caps->max_inputs = 16;
     caps->max_outputs = 16;
@@ -3573,19 +4523,28 @@ index eadca7b..23a9d6b 100755
     caps->max_const_buffers = 1;
     caps->max_temps = 16; // scalars
     caps->max_texture_samplers = 16;
-@@ -389,6 +394,11 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
+@@ -389,15 +401,33 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
     if (target != PIPE_BUFFER && grate_pixel_format(format) < 0)
        return false;
  
+-   /* RGBA storage is needed for sampler uploads.  Advertising it as a render
+-    * target also enables Mesa's GPU readback conversion path, which this
+-    * driver cannot yet execute (fragment uniforms and blits are incomplete).
+-    */
+-   if ((usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT)) &&
 +   /* Z24S8 is a Z16 surface underneath (grate_storage_format()): only offer
 +    * it as a depth/stencil attachment, never for sampling or transfers. */
 +   if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT && (usage & ~PIPE_BIND_DEPTH_STENCIL))
 +      return false;
 +
-    /* RGBA storage is needed for sampler uploads.  Advertising it as a render
-     * target also enables Mesa's GPU readback conversion path, which this
-     * driver cannot yet execute (fragment uniforms and blits are incomplete).
-@@ -398,6 +408,16 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
++   /* RGBA8 render targets: the surface descriptor's B8G8R8A8 layout (byte
++    * order R,G,B,A) swaps the channels in the colour write as it does for
++    * sampling. Chromium renders into RGBA dmabufs (DRM ABGR8888) and gets
++    * GL_FRAMEBUFFER_UNSUPPORTED without this. Readback stays on the CPU
++    * (texture_transfer_modes DEFAULT); RGBA<->BGRA blits convert on the CPU
++    * (grate_blit). Not offered for scanout. */
++   if ((usage & PIPE_BIND_SCANOUT) &&
+        (format == PIPE_FORMAT_R8G8B8A8_UNORM ||
          format == PIPE_FORMAT_R8G8B8X8_UNORM))
        return false;
  
@@ -3596,13 +4555,48 @@ index eadca7b..23a9d6b 100755
 +    * renderbuffers use those. */
 +   if ((usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT)) &&
 +       !util_format_is_depth_or_stencil(format) &&
-+       format != PIPE_FORMAT_B8G8R8A8_UNORM && format != PIPE_FORMAT_B8G8R8X8_UNORM)
++       format != PIPE_FORMAT_B8G8R8A8_UNORM && format != PIPE_FORMAT_B8G8R8X8_UNORM &&
++       format != PIPE_FORMAT_R8G8B8A8_UNORM && format != PIPE_FORMAT_R8G8B8X8_UNORM)
 +      return false;
 +
     if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) {
        if (grate_pixel_format(format) < 0)
           return false;
-@@ -452,7 +472,7 @@ grate_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
+@@ -406,12 +436,22 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
+    return true;
+ }
+ 
++/* grate's flush is synchronous, so every fence it hands out is already
++ * signalled: one static object, no refcounting needed. */
++static char grate_fence_dummy;
++
++struct pipe_fence_handle *
++grate_signalled_fence(void)
++{
++   return (struct pipe_fence_handle *)&grate_fence_dummy;
++}
++
+ static void
+ grate_screen_fence_reference(struct pipe_screen *pscreen,
+                              struct pipe_fence_handle **ptr,
+                              struct pipe_fence_handle *fence)
+ {
+-   grate_unimplemented();
++   *ptr = fence;
+ }
+ 
+ static bool
+@@ -420,8 +460,7 @@ grate_screen_fence_finish(struct pipe_screen *screen,
+                           struct pipe_fence_handle *fence,
+                           uint64_t timeout)
+ {
+-   grate_unimplemented();
+-   return false;
++   return true;
+ }
+ 
+ static const uint64_t grate_available_modifiers[] = {
+@@ -452,7 +491,7 @@ grate_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
  
  static const nir_shader_compiler_options grate_base_compiler_options = {
     /*
@@ -3611,7 +4605,7 @@ index eadca7b..23a9d6b 100755
     .fuse_ffma64 = true,
     .lower_bitops = true,
     .lower_extract_byte = true,
-@@ -473,6 +493,27 @@ static const nir_shader_compiler_options grate_base_compiler_options = {
+@@ -473,6 +512,33 @@ static const nir_shader_compiler_options grate_base_compiler_options = {
      */
     .lower_fdiv = true,
     .no_integers = true,
@@ -3635,11 +4629,29 @@ index eadca7b..23a9d6b 100755
 +   .lower_fpow = true,
 +   .lower_fdph = true,
 +   .lower_fmod = true,
++   .lower_fsign = true, /* no SSG: (a > 0) - (a < 0) */
++   /* No branches or loops in the fragment pipeline: constant-bound loops
++    * (GLSL ES 1.00 has no others) are unrolled. Skia's blur kernels loop
++    * over 6 or 8 uniform-array entries. */
++   .max_unroll_iterations = 32,
++   .force_indirect_unrolling = nir_var_all,
 +   /* fdot is split in grate_create_fs_state() (nir_lower_alu_to_scalar). */
  };
  
  static bool
-@@ -525,7 +566,7 @@ grate_screen_create(int fd)
+@@ -507,9 +573,11 @@ grate_screen_create(int fd)
+       return NULL;
+ 
+    screen->fd = fd;
++   simple_mtx_init(&screen->fs_reject_lock, mtx_plain);
+    err = grate_device_new(fd, &screen->drm);
+    if (err) {
+       fprintf(stderr, "grate_device_new err: %d\n", err);
++      simple_mtx_destroy(&screen->fs_reject_lock);
+       FREE(screen);
+       return NULL;
+    }
+@@ -525,7 +593,7 @@ grate_screen_create(int fd)
     screen->base.is_dmabuf_modifier_supported = grate_screen_is_dmabuf_modifier_supported;
     
     screen->base.nir_options[MESA_SHADER_VERTEX] = &grate_base_compiler_options;
@@ -3648,11 +4660,55 @@ index eadca7b..23a9d6b 100755
  
     /* fence functions */
     screen->base.fence_reference = grate_screen_fence_reference;
+diff --git a/src/gallium/drivers/grate/grate_screen.h b/src/gallium/drivers/grate/grate_screen.h
+index 5571af1..0a76d4e 100644
+--- a/src/gallium/drivers/grate/grate_screen.h
++++ b/src/gallium/drivers/grate/grate_screen.h
+@@ -3,6 +3,7 @@
+ 
+ #include "pipe/p_screen.h"
+ #include "util/slab.h"
++#include "util/simple_mtx.h"
+ 
+ struct grate_device;
+ 
+@@ -12,6 +13,8 @@ extern uint32_t grate_debug;
+ #define GRATE_DEBUG_TGSI 0x2
+ #define GRATE_DEBUG_TRACE 0x4
+ 
++#define GRATE_FS_REJECT_CACHE 256
++
+ struct grate_screen {
+    struct pipe_screen base;
+ 
+@@ -19,6 +22,14 @@ struct grate_screen {
+ 
+    int fd;
+    struct grate_device *drm;
++
++   /* Fragment shaders that did not fit, by hash of their final TGSI
++    * (grate_program.c): applications such as Skia create the same program
++    * again on every draw, and each rejection otherwise reruns all trial
++    * compiles (~0.25 s on Tegra 3). Ring buffer, 0 = empty slot. */
++   simple_mtx_t fs_reject_lock;
++   uint64_t fs_rejected[GRATE_FS_REJECT_CACHE];
++   unsigned fs_rejected_next;
+ };
+ 
+ static inline struct grate_screen *
 diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
-index 5e0b336..3f76231 100644
+index 5e0b336..11d94e5 100644
 --- a/src/gallium/drivers/grate/grate_state.c
 +++ b/src/gallium/drivers/grate/grate_state.c
-@@ -72,6 +72,12 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
+@@ -10,6 +10,7 @@
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+ #include "util/u_framebuffer.h"
++#include "pipe/p_shader_tokens.h"
+ 
+ #include "grate_compiler.h"
+ #include "grate_common.h"
+@@ -72,8 +73,15 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
  {
     struct grate_context *context = grate_context(pcontext);
     struct pipe_framebuffer_state *cso = &context->framebuffer.base;
@@ -3664,8 +4720,24 @@ index 5e0b336..3f76231 100644
 +
     context->framebuffer.rt_mask = 0;
     context->framebuffer.num_rts = 0;
++   context->framebuffer.rt_shared = false;
  
-@@ -110,8 +116,8 @@ grate_set_scissor_states(struct pipe_context *pcontext,
+    util_copy_framebuffer_state(cso, framebuffer);
+ 
+@@ -81,8 +89,11 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
+     * even without depth, matching the fragment compiler's DW stores.
+     */
+    for (unsigned int i = 0; i < framebuffer->nr_cbufs; i++) {
+-      if (framebuffer->cbufs[i].texture)
++      if (framebuffer->cbufs[i].texture) {
+          grate_add_render_target(context, &framebuffer->cbufs[i], i + 1);
++         if (grate_resource(framebuffer->cbufs[i].texture)->shared)
++            context->framebuffer.rt_shared = true;
++      }
+    }
+    
+    if (framebuffer->zsbuf.texture) {
+@@ -110,8 +121,8 @@ grate_set_scissor_states(struct pipe_context *pcontext,
                           unsigned num_scissors,
                           const struct pipe_scissor_state * scissors)
  {
@@ -3676,7 +4748,19 @@ index 5e0b336..3f76231 100644
  }
  
  static void
-@@ -191,7 +197,8 @@ static void
+@@ -157,6 +168,11 @@ grate_set_viewport_states(struct pipe_context *pcontext,
+    context->guardband[3] = u_bitcast_f2u(6.99);
+ 
+    context->y_invert = viewports[0].scale[1] < 0.0f;
++
++   context->wpos_viewport[0] = viewports[0].scale[0];
++   context->wpos_viewport[1] = viewports[0].scale[1];
++   context->wpos_viewport[2] = viewports[0].translate[0];
++   context->wpos_viewport[3] = viewports[0].translate[1];
+ }
+ 
+ static void
+@@ -191,7 +207,8 @@ static void
  grate_set_blend_color(struct pipe_context *pctx,
                        const struct pipe_blend_color *blend_color)
  {
@@ -3686,7 +4770,7 @@ index 5e0b336..3f76231 100644
  }
  
  static void
-@@ -246,19 +253,53 @@ grate_create_blend_state(struct pipe_context *pcontext,
+@@ -246,19 +263,53 @@ grate_create_blend_state(struct pipe_context *pcontext,
  static void
  grate_bind_blend_state(struct pipe_context *pcontext, void *so)
  {
@@ -3753,7 +4837,7 @@ index 5e0b336..3f76231 100644
  }
  
  static void
-@@ -606,7 +647,7 @@ emit_attribs(struct grate_context *context, uint32_t **ptrp)
+@@ -606,7 +657,7 @@ emit_attribs(struct grate_context *context, uint32_t **ptrp)
  }
  
  static void
@@ -3762,7 +4846,7 @@ index 5e0b336..3f76231 100644
  {
     unsigned int i;
     struct grate_stream *stream = &context->gr3d->stream;
-@@ -614,8 +655,14 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
+@@ -614,8 +665,14 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
  
     /* Emit only populated slots: slot 0 is absent for colour-only draws,
      * and Gallium may also leave holes among the colour attachments.
@@ -3778,7 +4862,7 @@ index 5e0b336..3f76231 100644
        if (!(fb->rt_mask & (1u << i)))
           continue;
  
-@@ -637,7 +684,20 @@ static void
+@@ -637,7 +694,20 @@ static void
  emit_scissor(struct grate_context *context, uint32_t **ptrp)
  {
     struct grate_stream *stream = &context->gr3d->stream;
@@ -3800,7 +4884,28 @@ index 5e0b336..3f76231 100644
  }
  
  static void
-@@ -708,27 +768,67 @@ fragment_fp20(float value)
+@@ -683,8 +753,18 @@ emit_vs_uniforms(struct grate_context *context, uint32_t **ptrp)
+ 
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
+    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
+-   if (num_imm)
+-      grate_stream_push_words(stream, ptrp, context->vshader->immediates[0], num_imm * 4, 0);
++   if (num_imm) {
++      const struct grate_vertex_shader_state *vs = context->vshader;
++      if (vs->wpos_imm >= 0) {
++         /* the viewport for the gl_FragCoord export, see grate_program.c */
++         uint32_t imm[GRATE_VP_MAX_IMMEDIATES][4];
++         memcpy(imm, vs->immediates, num_imm * sizeof(imm[0]));
++         memcpy(imm[vs->wpos_imm], context->wpos_viewport, sizeof(imm[0]));
++         grate_stream_push_words(stream, ptrp, imm[0], num_imm * 4, 0);
++      } else {
++         grate_stream_push_words(stream, ptrp, vs->immediates[0], num_imm * 4, 0);
++      }
++   }
+    if (user_words)
+       grate_stream_push_words(stream, ptrp, constbuf->user_buffer, user_words, 0);
+ }
+@@ -708,31 +788,130 @@ fragment_fp20(float value)
     return sign | ((uint32_t)adjusted << 13) | ((bits & 0x7fffff) >> 10);
  }
  
@@ -3843,6 +4948,24 @@ index 5e0b336..3f76231 100644
 +   float pre[GRATE_FP_PRE_MAX_SLOTS * 4];
 +   if (info->num_pre)
 +      grate_fp_eval_preamble(info, cb->user_buffer, cb->user_buffer ? cb->buffer_size : 0, pre);
++   /* Block scale of the packed tap offsets (fp_choose_scalar_packs()): the
++    * power of two that brings the largest one into 1 .. 2. */
++   float scale = 1.0f, largest = 0.0f;
++   for (unsigned i = 0; i < info->num_constants; i++) {
++      if (info->constants[i].scale != GRATE_FP_SCALE_DIV)
++         continue;
++      const int words[] = {info->constants[i].word, info->constants[i].word_hi};
++      for (unsigned h = 0; h < 2; h++)
++         if (words[h] >= 0)
++            largest = MAX2(largest, fabsf(fs_constant_value(cb, pre, words[h])));
++   }
++   if (largest > 0.0f && largest < 1e30f) {
++      while (largest / scale > 1.99f)
++         scale *= 2.0f;
++      while (largest / scale < 0.995f)
++         scale *= 0.5f;
++   }
++   float carry = 0.0f; /* rounding error of the previous diffused half */
 +   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(0x820, info->num_constants + num_blend));
     for (unsigned i = 0; i < info->num_constants; i++) {
 -      float value = info->constants[i].immediate;
@@ -3851,13 +4974,26 @@ index 5e0b336..3f76231 100644
 -         assert(cb->user_buffer && ((unsigned)word + 1) * sizeof(float) <= cb->buffer_size);
 -         memcpy(&value, (const uint8_t *)cb->user_buffer + word * sizeof(float), sizeof(value));
 +      if (info->constants[i].fx10) {
-+         /* two channels as FX10 halves */
-+         uint32_t packed = fragment_fx10(fs_constant_value(cb, pre, word)) |
-+                           fragment_fx10(fs_constant_value(cb, pre, word + 1)) << 10;
++         /* two values as FX10 halves */
++         const int words[] = {word, info->constants[i].word_hi};
++         uint32_t packed = 0;
++         for (unsigned h = 0; h < 2; h++) {
++            float value = words[h] >= 0 ? fs_constant_value(cb, pre, words[h]) : 0.0f;
++            if (info->constants[i].scale == GRATE_FP_SCALE_DIV)
++               value /= scale;
++            if (info->constants[i].diffuse && words[h] >= 0)
++               value += carry;
++            const uint32_t half = fragment_fx10(value);
++            if (info->constants[i].diffuse && words[h] >= 0)
++               carry = value - (float)((int)(half ^ 0x200) - 0x200) / 256.0f;
++            packed |= half << (10 * h);
++         }
 +         GRATE_PUSHBUF_WORD(*ptrp, packed);
 +         continue;
        }
 +      float value = word >= 0 ? fs_constant_value(cb, pre, word) : info->constants[i].immediate;
++      if (info->constants[i].scale == GRATE_FP_SCALE_MUL)
++         value *= scale;
 +      GRATE_PUSHBUF_WORD(*ptrp, fragment_fp20(value));
 +   }
 +   for (unsigned i = 0; i < num_blend; i++) {
@@ -3875,7 +5011,39 @@ index 5e0b336..3f76231 100644
  {
     grate_stream_push_words(stream, ptrp, blob->commands, blob->num_commands, 0);
  }
-@@ -740,9 +840,8 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
+ 
++/* Linker source word of fragment row i: the vertex output with the same
++ * semantic as the TGSI input the row exports; gl_FragCoord (POSITION) takes
++ * the window-position export. The compiled word assumes vertex output
++ * n + 1 for input n and is kept if the vertex shader has no such output. */
++static uint32_t
++grate_fp_link_src(const struct grate_vertex_shader_state *vs, const struct grate_fp_info *info, int i)
++{
++   uint32_t src = info->inputs[i].src;
++   int in = info->inputs[i].tgsi_in;
++   if (in < 0 || in >= 16)
++      return src;
++   unsigned name = info->in_sem_name[in], index = info->in_sem_index[in];
++   int out = -1;
++   if (name == TGSI_SEMANTIC_POSITION) {
++      out = vs->wpos_out;
++   } else {
++      for (unsigned o = 0; o < vs->num_outputs; o++) {
++         if (vs->out_sem_name[o] == name && vs->out_sem_index[o] == index && (int)o != vs->wpos_out) {
++            out = o;
++            break;
++         }
++      }
++   }
++   if (out < 0)
++      return src;
++   return (src & ~(0x3fu << 3)) | ((uint32_t)out << 3);
++}
++
+ static void
+ emit_program(struct grate_context *context, uint32_t **ptrp)
+ {
+@@ -740,9 +919,8 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
     uint32_t cull_face_linker_setup;
  
     emit_shader(stream, ptrp, &context->vshader->blob);
@@ -3887,7 +5055,38 @@ index 5e0b336..3f76231 100644
     } else {
        emit_shader(stream, ptrp, &context->fshader->blob);
     }
-@@ -855,15 +954,23 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+@@ -766,7 +944,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
+    linker_insts[2] = host1x_opcode_incr(REG_TGR3D_SU_INST_EVEN(0), info->num_inputs * 2);
+ 
+    for (int i = 0; i < info->num_inputs; ++i) {
+-      linker_insts[3 + i * 2] = info->inputs[i].src;
++      linker_insts[3 + i * 2] = grate_fp_link_src(context->vshader, info, i);
+       linker_insts[3 + i * 2 + 1] = info->inputs[i].dst;
+    }
+ 
+@@ -831,9 +1009,19 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
+          break;
+       }
+       uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(texture_format);
+-      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 2;
++      /* The hardware's REPEAT on a non-power-of-two texture wraps the texel
++       * address at the next lower power of two (1366x768 sampled 0..1 shows
++       * x 1024.. as columns 0..341 and y 512.. as rows 0..255: a 2x2 grid;
++       * build/gltest/dmabuftest full). GL's default wrap is REPEAT and many
++       * clients leave it while sampling inside [0,1] (Smithay's dmabuf
++       * import did), where CLAMP_TO_EDGE gives the same result. Real NPOT
++       * tiling would need texcoord wrapping in the shader; until then clamp,
++       * which is exact in [0,1] and at least not scrambled outside. */
++      const bool npot_w = !util_is_power_of_two_or_zero(res->b.width0);
++      const bool npot_h = !util_is_power_of_two_or_zero(res->b.height0);
++      if (sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE || npot_w) lo |= 2;
+       else assert(sampler->wrap_s == PIPE_TEX_WRAP_REPEAT);
+-      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE) lo |= 1;
++      if (sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE || npot_h) lo |= 1;
+       else assert(sampler->wrap_t == PIPE_TEX_WRAP_REPEAT);
+       if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
+       if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR) lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
+@@ -855,15 +1043,23 @@ emit_textures(struct grate_context *ctx, uint32_t **ptrp)
  }
  
  void
@@ -4221,19 +5420,20 @@ index 0505f23..55b19f6 100644
  grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
                          struct grate_bo *bo, unsigned offset);
 diff --git a/src/gallium/drivers/grate/meson.build b/src/gallium/drivers/grate/meson.build
-index 9f3c537..3883d3a 100644
+index 9f3c537..97f4a08 100644
 --- a/src/gallium/drivers/grate/meson.build
 +++ b/src/gallium/drivers/grate/meson.build
-@@ -27,6 +27,8 @@ files_libgrate = files(
+@@ -27,6 +27,9 @@ files_libgrate = files(
    'drm/tegra.h',
    'fp/fpir.h',
    'fp/pack.c',
 +  'fp/preamble.c',
++  'fp/reassoc.c',
 +  'fp/sched.c',
    'fp/tgsi.c',
    'fp/vliw.h',
    'vp/pack.c',
-@@ -39,6 +41,8 @@ files_libgrate = files(
+@@ -39,6 +42,8 @@ files_libgrate = files(
    'grate_context.c',
    'grate_context.h',
    'grate_draw.c',
@@ -4242,7 +5442,7 @@ index 9f3c537..3883d3a 100644
    'grate_draw.h',
    'grate_program.c',
    'grate_program.h',
-@@ -65,7 +69,7 @@ libgrate = static_library(
+@@ -65,7 +70,7 @@ libgrate = static_library(
      inc_src, inc_include, inc_gallium, inc_gallium_aux,
      inc_gallium_drivers, inc_libgrate,
    ],
@@ -4450,7 +5650,7 @@ index 58a8794..28d6c88 100644
  void
 diff --git a/src/gallium/drivers/grate/fp/preamble.c b/src/gallium/drivers/grate/fp/preamble.c
 new file mode 100644
-index 0000000..5dca5ba
+index 0000000..a2cdc26
 --- /dev/null
 +++ b/src/gallium/drivers/grate/fp/preamble.c
 @@ -0,0 +1,681 @@
@@ -4830,7 +6030,7 @@ index 0000000..5dca5ba
 +      /* MAD with a uniform product: hoist the product (one constant word
 +       * per channel instead of two or three), keep ADD product, c. */
 +      if (inst.Instruction.Opcode == TGSI_OPCODE_MAD && !derivative &&
-+          inst.Instruction.NumDstRegs == 1 &&
++          inst.Instruction.NumDstRegs == 1 && !GRATE_FP_KEEP_PRODUCT(&inst) &&
 +          src_is_uniform(&h, &inst, 0) && src_is_uniform(&h, &inst, 1) &&
 +          fp->info.num_pre_slots < GRATE_FP_PRE_MAX_SLOTS) {
 +         struct grate_fp_pre_op op = {
@@ -5589,6 +6789,1159 @@ index 0000000..432ac91
 +   free(order);
 +   free(uses_left);
 +   free(last_write);
++   return changed;
++}
+diff --git a/src/gallium/drivers/grate/fp/reassoc.c b/src/gallium/drivers/grate/fp/reassoc.c
+new file mode 100644
+index 0000000..b3a0bdc
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/reassoc.c
+@@ -0,0 +1,1147 @@
++/* Fragment reassociation of texture coordinates (Skia's Gaussian blur).
++ *
++ * Skia's 1D blur samples N taps at
++ *    M * vec3(coord + offset[k] * dir, 1)          (M, dir, offset[k] uniforms)
++ * optionally clamping one coordinate to a uniform range. Compiled as written
++ * every tap costs 3 vec4 MADs per pixel and a (preamble) constant per tap and
++ * coordinate; 12 or 16 taps fit neither the constant bank nor the program.
++ *
++ * This pass evaluates the program symbolically (every temporary component
++ * as a polynomial over uniform words and varying components), and rewrites
++ * each texture coordinate that is affine in the varyings as
++ *    a * E + B
++ * with B = (uniform coefficients) * varyings + uniform, computed once per
++ * pixel for all taps, E a uniform-only expression shared by the taps (CPU
++ * preamble) and `a` one raw uniform word per tap. A tap is then one MAD.
++ * A coordinate clamped to uniforms, clamp(Y, lo, hi), becomes
++ *    sat(a * E' + B') * max(hi - lo, 0) + lo,   E', B' scaled by 1 / (hi - lo)
++ * (two ALU operations; MAD, MIN, MAX would be three dependent ones).
++ *
++ * Runs on the TGSI instruction list before the preamble hoist; the uniform
++ * expressions it emits are ordinary instructions that the hoist then moves
++ * to the CPU. Dead code is removed at the end. Only coordinates whose
++ * polynomial consists of constant-buffer words and varyings are touched.
++ */
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "grate_common.h"
++#include "grate_compiler.h"
++
++#include "tgsi/tgsi_parse.h"
++#include "tgsi/tgsi_util.h"
++#include "util/u_dynarray.h"
++#include "util/u_memory.h"
++
++#define RA_MAX_ATOMS 4
++#define RA_MAX_TERMS 10
++#define RA_MAX_SINKS 40
++#define RA_MAX_ATOM_COUNT 1024
++#define RA_CLAMP_EPS 1e-5f
++
++enum ra_kind {
++   RA_CONST, /* index = constant word */
++   RA_INPUT, /* index = input * 4 + component */
++   RA_DEF,   /* index = instruction * 4 + component: an opaque result */
++   RA_GEN,   /* index = generated uniform scalar (st->gen) */
++};
++
++struct ra_atom {
++   uint8_t kind;
++   bool pixel;
++   int index;
++   int clamp; /* RA_DEF: clamp record, or -1 */
++};
++
++struct ra_term {
++   float coef;
++   uint8_t n;
++   uint16_t atom[RA_MAX_ATOMS]; /* sorted; unused entries 0 */
++};
++
++struct ra_poly {
++   uint8_t n; /* 0: the value 0 */
++   struct ra_term t[RA_MAX_TERMS];
++};
++
++/* MIN/MAX of a per-pixel polynomial and a uniform one */
++struct ra_minmax {
++   int atom;
++   unsigned opcode;
++   struct ra_poly x, u;
++};
++
++struct ra_clamp {
++   struct ra_poly y, lo, hi, z; /* z = (y - lo) * inv */
++   int inv, hl;                 /* RA_GEN atoms */
++};
++
++enum ra_gen_type { RA_GEN_INV, RA_GEN_HL };
++
++struct ra_gen {
++   uint8_t type;
++   struct ra_poly lo, hi;
++   bool emitted;
++   int temp;
++};
++
++/* a scalar operand of emitted code */
++struct ra_ref {
++   uint8_t file, comp;
++   bool negate;
++   int index;
++};
++
++struct ra_op {
++   uint8_t opcode, nsrc, comp;
++   bool sat, keep;
++   int temp;
++   struct ra_ref src[3];
++};
++
++enum ra_mode { RA_KEEP, RA_AFFINE, RA_CLAMPED };
++
++struct ra_sink {
++   unsigned inst;
++   uint8_t mode[2];
++   struct ra_poly q[2]; /* AFFINE: the coordinate; CLAMPED: z */
++   int clamp[2];
++   int a[2];            /* factor atom or -1 */
++   struct ra_poly e[2], b[2];
++   struct ra_ref keep[2];
++};
++
++struct ra_cached {
++   struct ra_poly poly;
++   struct ra_ref ref;
++};
++
++struct ra_state {
++   struct grate_fp_shader *fp;
++   struct ra_atom atoms[RA_MAX_ATOM_COUNT];
++   unsigned num_atoms;
++   struct ra_poly *cur; /* [temp * 4 + comp] */
++   uint8_t *has;
++   struct util_dynarray minmax, clamps, gens;
++   struct ra_sink sinks[RA_MAX_SINKS];
++   unsigned num_sinks;
++   /* factor statistics: (E, a) pairs */
++   struct util_dynarray pairs;
++   /* emission */
++   struct util_dynarray out;    /* tgsi_full_instruction */
++   struct util_dynarray ops;    /* pending ra_op */
++   struct util_dynarray cache;  /* ra_cached: uniform scalars and bases */
++   int scratch;
++   bool keep; /* the next operations are factor * E + base (GRATE_FP_KEEP_PRODUCT) */
++   bool failed;
++};
++
++struct ra_pair {
++   struct ra_poly e;
++   int a;
++};
++
++/* ---- polynomials ---- */
++
++static int
++term_cmp(const struct ra_term *a, const struct ra_term *b)
++{
++   if (a->n != b->n)
++      return a->n < b->n ? -1 : 1;
++   for (unsigned i = 0; i < a->n; i++)
++      if (a->atom[i] != b->atom[i])
++         return a->atom[i] < b->atom[i] ? -1 : 1;
++   return 0;
++}
++
++/* sorts and merges `n` terms; false if more than RA_MAX_TERMS remain */
++static bool
++poly_from_terms(struct ra_poly *out, struct ra_term *t, unsigned n)
++{
++   for (unsigned i = 1; i < n; i++) {
++      struct ra_term key = t[i];
++      int j = i - 1;
++      while (j >= 0 && term_cmp(&t[j], &key) > 0) {
++         t[j + 1] = t[j];
++         j--;
++      }
++      t[j + 1] = key;
++   }
++   unsigned m = 0;
++   for (unsigned i = 0; i < n; i++) {
++      if (m && term_cmp(&t[m - 1], &t[i]) == 0)
++         t[m - 1].coef += t[i].coef;
++      else
++         t[m++] = t[i];
++      if (t[m - 1].coef == 0.0f)
++         m--;
++   }
++   if (m > RA_MAX_TERMS)
++      return false;
++   memset(out, 0, sizeof(*out));
++   out->n = m;
++   memcpy(out->t, t, m * sizeof(*t));
++   return true;
++}
++
++static struct ra_poly
++poly_const(float value)
++{
++   struct ra_poly p;
++   memset(&p, 0, sizeof(p));
++   if (value != 0.0f) {
++      p.n = 1;
++      p.t[0].coef = value;
++   }
++   return p;
++}
++
++static struct ra_poly
++poly_atom(unsigned atom)
++{
++   struct ra_poly p;
++   memset(&p, 0, sizeof(p));
++   p.n = 1;
++   p.t[0].coef = 1.0f;
++   p.t[0].n = 1;
++   p.t[0].atom[0] = atom;
++   return p;
++}
++
++static bool
++poly_add(struct ra_poly *out, const struct ra_poly *a, const struct ra_poly *b, float scale_b)
++{
++   struct ra_term t[RA_MAX_TERMS * 2];
++   memcpy(t, a->t, a->n * sizeof(*t));
++   for (unsigned i = 0; i < b->n; i++) {
++      t[a->n + i] = b->t[i];
++      t[a->n + i].coef *= scale_b;
++   }
++   return poly_from_terms(out, t, a->n + b->n);
++}
++
++static bool
++poly_mul(const struct ra_state *st, struct ra_poly *out, const struct ra_poly *a, const struct ra_poly *b)
++{
++   struct ra_term t[RA_MAX_TERMS * RA_MAX_TERMS];
++   unsigned n = 0;
++   for (unsigned i = 0; i < a->n; i++) {
++      for (unsigned j = 0; j < b->n; j++) {
++         const struct ra_term *x = &a->t[i], *y = &b->t[j];
++         if (x->n + y->n > RA_MAX_ATOMS)
++            return false;
++         struct ra_term r;
++         memset(&r, 0, sizeof(r));
++         r.coef = x->coef * y->coef;
++         unsigned p = 0, q = 0, pixels = 0;
++         while (p < x->n || q < y->n) {
++            uint16_t atom = (q >= y->n || (p < x->n && x->atom[p] <= y->atom[q])) ? x->atom[p++] : y->atom[q++];
++            pixels += st->atoms[atom].pixel;
++            r.atom[r.n++] = atom;
++         }
++         if (pixels > 1)
++            return false;
++         t[n++] = r;
++      }
++   }
++   return poly_from_terms(out, t, n);
++}
++
++static bool
++poly_equal(const struct ra_poly *a, const struct ra_poly *b)
++{
++   if (a->n != b->n)
++      return false;
++   for (unsigned i = 0; i < a->n; i++)
++      if (a->t[i].coef != b->t[i].coef || term_cmp(&a->t[i], &b->t[i]))
++         return false;
++   return true;
++}
++
++static bool
++term_pixel(const struct ra_state *st, const struct ra_term *t)
++{
++   for (unsigned i = 0; i < t->n; i++)
++      if (st->atoms[t->atom[i]].pixel)
++         return true;
++   return false;
++}
++
++static bool
++poly_pixel(const struct ra_state *st, const struct ra_poly *p)
++{
++   for (unsigned i = 0; i < p->n; i++)
++      if (term_pixel(st, &p->t[i]))
++         return true;
++   return false;
++}
++
++/* only constant-buffer words, varyings and generated uniforms */
++static bool
++poly_simple(const struct ra_state *st, const struct ra_poly *p)
++{
++   for (unsigned i = 0; i < p->n; i++)
++      for (unsigned k = 0; k < p->t[i].n; k++)
++         if (st->atoms[p->t[i].atom[k]].kind == RA_DEF)
++            return false;
++   return true;
++}
++
++static bool
++poly_trivial(const struct ra_poly *p)
++{
++   return p->n == 1 && p->t[0].n == 1 && p->t[0].coef == 1.0f;
++}
++
++static int
++ra_atom_id(struct ra_state *st, unsigned kind, int index, bool pixel)
++{
++   for (unsigned i = 0; i < st->num_atoms; i++)
++      if (st->atoms[i].kind == kind && st->atoms[i].index == index)
++         return i;
++   if (st->num_atoms == RA_MAX_ATOM_COUNT) {
++      st->failed = true;
++      return 0;
++   }
++   st->atoms[st->num_atoms] = (struct ra_atom){.kind = kind, .pixel = pixel, .index = index, .clamp = -1};
++   return st->num_atoms++;
++}
++
++/* ---- symbolic evaluation ---- */
++
++/* Component c of source operand s as a polynomial. false: not expressible
++ * (the reading instruction's result is opaque). */
++static bool
++ra_src_poly(struct ra_state *st, const struct tgsi_full_instruction *inst, unsigned s, unsigned c,
++            struct ra_poly *out)
++{
++   const struct tgsi_src_register *r = &inst->Src[s].Register;
++   const unsigned swizzle[] = {r->SwizzleX, r->SwizzleY, r->SwizzleZ, r->SwizzleW};
++   const unsigned comp = swizzle[c];
++   if (r->Indirect || r->Absolute)
++      return false;
++   switch (r->File) {
++   case TGSI_FILE_IMMEDIATE:
++      if (r->Index >= (int)st->fp->num_immediates)
++         return false;
++      *out = poly_const(st->fp->immediates[r->Index][comp]);
++      break;
++   case TGSI_FILE_CONSTANT:
++      if (r->Dimension && (inst->Src[s].Dimension.Index != 0 || inst->Src[s].Dimension.Indirect))
++         return false;
++      *out = poly_atom(ra_atom_id(st, RA_CONST, r->Index * 4 + comp, false));
++      break;
++   case TGSI_FILE_INPUT:
++      *out = poly_atom(ra_atom_id(st, RA_INPUT, r->Index * 4 + comp, true));
++      break;
++   case TGSI_FILE_TEMPORARY:
++      if (r->Index >= GRATE_FP_MAX_TEMPS)
++         return false;
++      if (st->has[r->Index * 4 + comp])
++         *out = st->cur[r->Index * 4 + comp];
++      else /* never written: an unknown per-pixel value */
++         *out = poly_atom(ra_atom_id(st, RA_DEF, -1 - (r->Index * 4 + (int)comp), true));
++      break;
++   default:
++      return false;
++   }
++   if (r->Negate)
++      for (unsigned i = 0; i < out->n; i++)
++         out->t[i].coef = -out->t[i].coef;
++   return true;
++}
++
++static int
++ra_gen(struct ra_state *st, unsigned type, const struct ra_poly *lo, const struct ra_poly *hi)
++{
++   unsigned n = util_dynarray_num_elements(&st->gens, struct ra_gen);
++   struct ra_gen *gens = st->gens.data;
++   for (unsigned i = 0; i < n; i++)
++      if (gens[i].type == type && poly_equal(&gens[i].lo, lo) && poly_equal(&gens[i].hi, hi))
++         return ra_atom_id(st, RA_GEN, i, false);
++   struct ra_gen gen = {.type = type, .lo = *lo, .hi = *hi, .temp = -1};
++   util_dynarray_append_typed(&st->gens, struct ra_gen, gen);
++   return ra_atom_id(st, RA_GEN, n, false);
++}
++
++/* MIN/MAX whose operands are a per-pixel and a uniform polynomial: remember
++ * it; MIN(MAX(y, lo), hi) or MAX(MIN(y, hi), lo) is a clamp. */
++static void
++ra_minmax(struct ra_state *st, const struct tgsi_full_instruction *inst, unsigned c, int atom)
++{
++   struct ra_poly p[2];
++   if (!ra_src_poly(st, inst, 0, c, &p[0]) || !ra_src_poly(st, inst, 1, c, &p[1]))
++      return;
++   const bool pix0 = poly_pixel(st, &p[0]), pix1 = poly_pixel(st, &p[1]);
++   if (pix0 == pix1)
++      return;
++   struct ra_minmax mm = {.atom = atom, .opcode = inst->Instruction.Opcode, .x = p[pix1], .u = p[!pix1]};
++   util_dynarray_append_typed(&st->minmax, struct ra_minmax, mm);
++
++   if (!poly_trivial(&mm.x) || st->atoms[mm.x.t[0].atom[0]].kind != RA_DEF)
++      return;
++   const int inner_atom = mm.x.t[0].atom[0];
++   util_dynarray_foreach(&st->minmax, struct ra_minmax, inner) {
++      if (inner->atom != inner_atom || inner->opcode == mm.opcode)
++         continue;
++      struct ra_clamp cl;
++      memset(&cl, 0, sizeof(cl));
++      cl.y = inner->x;
++      cl.lo = mm.opcode == TGSI_OPCODE_MIN ? inner->u : mm.u;
++      cl.hi = mm.opcode == TGSI_OPCODE_MIN ? mm.u : inner->u;
++      if (!poly_simple(st, &cl.y) || !poly_simple(st, &cl.lo) || !poly_simple(st, &cl.hi) ||
++          !poly_pixel(st, &cl.y))
++         return;
++      cl.inv = ra_gen(st, RA_GEN_INV, &cl.lo, &cl.hi);
++      cl.hl = ra_gen(st, RA_GEN_HL, &cl.lo, &cl.hi);
++      struct ra_poly d, inv = poly_atom(cl.inv);
++      if (st->failed || !poly_add(&d, &cl.y, &cl.lo, -1.0f) || !poly_mul(st, &cl.z, &d, &inv))
++         return;
++      st->atoms[atom].clamp = util_dynarray_num_elements(&st->clamps, struct ra_clamp);
++      util_dynarray_append_typed(&st->clamps, struct ra_clamp, cl);
++      return;
++   }
++}
++
++static void
++ra_sink(struct ra_state *st, const struct tgsi_full_instruction *inst, unsigned n)
++{
++   const struct tgsi_src_register *r = &inst->Src[0].Register;
++   if (inst->Texture.Texture != TGSI_TEXTURE_2D || r->Indirect || r->Absolute || st->num_sinks == RA_MAX_SINKS)
++      return;
++   const unsigned swizzle[] = {r->SwizzleX, r->SwizzleY};
++   struct ra_sink sink;
++   memset(&sink, 0, sizeof(sink));
++   sink.inst = n;
++   bool any = false;
++   for (unsigned c = 0; c < 2; c++) {
++      struct ra_poly p;
++      sink.keep[c] = (struct ra_ref){.file = r->File, .comp = swizzle[c], .negate = r->Negate, .index = r->Index};
++      sink.a[c] = sink.clamp[c] = -1;
++      if (!ra_src_poly(st, inst, 0, c, &p))
++         continue;
++      if (poly_trivial(&p)) {
++         const struct ra_atom *atom = &st->atoms[p.t[0].atom[0]];
++         if (atom->kind == RA_DEF && atom->clamp >= 0) {
++            sink.mode[c] = RA_CLAMPED;
++            sink.clamp[c] = atom->clamp;
++            sink.q[c] = util_dynarray_element(&st->clamps, struct ra_clamp, atom->clamp)->z;
++            any = true;
++         }
++      } else if (poly_pixel(st, &p) && poly_simple(st, &p)) {
++         sink.mode[c] = RA_AFFINE;
++         sink.q[c] = p;
++         any = true;
++      }
++   }
++   if (any)
++      st->sinks[st->num_sinks++] = sink;
++}
++
++static bool
++ra_analyze(struct ra_state *st, const struct tgsi_full_instruction *code, unsigned count)
++{
++   for (unsigned n = 0; n < count && !st->failed; n++) {
++      const struct tgsi_full_instruction *inst = &code[n];
++      const unsigned opcode = inst->Instruction.Opcode;
++      if (inst->Instruction.NumDstRegs > 1)
++         return false;
++      for (unsigned s = 0; s < inst->Instruction.NumSrcRegs; s++)
++         if (inst->Src[s].Register.Indirect ||
++             (inst->Src[s].Register.File == TGSI_FILE_TEMPORARY && inst->Src[s].Register.Index >= GRATE_FP_MAX_TEMPS))
++            return false;
++      if (opcode == TGSI_OPCODE_TEX)
++         ra_sink(st, inst, n);
++      if (!inst->Instruction.NumDstRegs)
++         continue;
++      const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
++      if (dst->Indirect || (dst->File == TGSI_FILE_TEMPORARY && dst->Index >= GRATE_FP_MAX_TEMPS))
++         return false;
++      if (dst->File != TGSI_FILE_TEMPORARY)
++         continue;
++
++      /* is the (opaque) result a per-pixel value? */
++      bool pixel = opcode == TGSI_OPCODE_TEX;
++      for (unsigned s = 0; s < inst->Instruction.NumSrcRegs && !pixel; s++) {
++         if (inst->Src[s].Register.File == TGSI_FILE_SAMPLER)
++            continue;
++         const unsigned used = tgsi_util_get_inst_usage_mask(inst, s);
++         const struct tgsi_src_register *r = &inst->Src[s].Register;
++         const unsigned swizzle[] = {r->SwizzleX, r->SwizzleY, r->SwizzleZ, r->SwizzleW};
++         for (unsigned c = 0; c < 4 && !pixel; c++) {
++            /* find a destination channel reading register component c */
++            if (!(used & (1 << c)))
++               continue;
++            struct ra_poly p;
++            unsigned lane = 0;
++            while (lane < 3 && swizzle[lane] != c)
++               lane++;
++            pixel = swizzle[lane] != c || !ra_src_poly(st, inst, s, lane, &p) || poly_pixel(st, &p) ||
++                    r->File == TGSI_FILE_INPUT;
++         }
++      }
++
++      struct ra_poly result[4];
++      for (unsigned c = 0; c < 4; c++) {
++         if (!(dst->WriteMask & (1 << c)))
++            continue;
++         struct ra_poly a, b, d, m;
++         bool ok = !inst->Instruction.Saturate;
++         switch (ok ? opcode : TGSI_OPCODE_NOP) {
++         case TGSI_OPCODE_MOV:
++            ok = ra_src_poly(st, inst, 0, c, &result[c]);
++            break;
++         case TGSI_OPCODE_ADD:
++            ok = ra_src_poly(st, inst, 0, c, &a) && ra_src_poly(st, inst, 1, c, &b) &&
++                 poly_add(&result[c], &a, &b, 1.0f);
++            break;
++         case TGSI_OPCODE_MUL:
++            ok = ra_src_poly(st, inst, 0, c, &a) && ra_src_poly(st, inst, 1, c, &b) &&
++                 poly_mul(st, &result[c], &a, &b);
++            break;
++         case TGSI_OPCODE_MAD:
++            ok = ra_src_poly(st, inst, 0, c, &a) && ra_src_poly(st, inst, 1, c, &b) &&
++                 ra_src_poly(st, inst, 2, c, &d) && poly_mul(st, &m, &a, &b) &&
++                 poly_add(&result[c], &m, &d, 1.0f);
++            break;
++         default:
++            ok = false;
++            break;
++         }
++         if (!ok) {
++            int atom = ra_atom_id(st, RA_DEF, n * 4 + c, pixel);
++            result[c] = poly_atom(atom);
++            if ((opcode == TGSI_OPCODE_MIN || opcode == TGSI_OPCODE_MAX) && !inst->Instruction.Saturate)
++               ra_minmax(st, inst, c, atom);
++         }
++      }
++      for (unsigned c = 0; c < 4; c++) {
++         if (!(dst->WriteMask & (1 << c)))
++            continue;
++         st->cur[dst->Index * 4 + c] = result[c];
++         st->has[dst->Index * 4 + c] = 1;
++      }
++   }
++   return !st->failed && st->num_sinks;
++}
++
++/* ---- decomposition q = a * E + B ---- */
++
++/* E = (terms of the uniform part of q containing atom a) / a; false if a
++ * occurs twice in a term, never, or E is a plain number. */
++static bool
++ra_quotient(const struct ra_state *st, const struct ra_poly *q, int a, struct ra_poly *e, struct ra_poly *rest)
++{
++   struct ra_term te[RA_MAX_TERMS], tr[RA_MAX_TERMS];
++   unsigned ne = 0, nr = 0;
++   bool atoms = false;
++   for (unsigned i = 0; i < q->n; i++) {
++      const struct ra_term *t = &q->t[i];
++      unsigned hits = 0;
++      for (unsigned k = 0; k < t->n; k++)
++         hits += t->atom[k] == a;
++      if (!hits || term_pixel(st, t)) {
++         if (hits)
++            return false;
++         tr[nr++] = *t;
++         continue;
++      }
++      if (hits > 1)
++         return false;
++      struct ra_term r;
++      memset(&r, 0, sizeof(r));
++      r.coef = t->coef;
++      for (unsigned k = 0; k < t->n; k++)
++         if (t->atom[k] != a)
++            r.atom[r.n++] = t->atom[k];
++      atoms |= r.n > 0;
++      te[ne++] = r;
++   }
++   if (!ne || !atoms)
++      return false;
++   return poly_from_terms(e, te, ne) && poly_from_terms(rest, tr, nr);
++}
++
++static void
++ra_collect_pairs(struct ra_state *st, const struct ra_poly *q)
++{
++   for (unsigned i = 0; i < q->n; i++) {
++      if (term_pixel(st, &q->t[i]))
++         continue;
++      for (unsigned k = 0; k < q->t[i].n; k++) {
++         const int a = q->t[i].atom[k];
++         struct ra_pair pair = {.a = a};
++         struct ra_poly rest;
++         if (st->atoms[a].kind != RA_CONST || !ra_quotient(st, q, a, &pair.e, &rest))
++            continue;
++         bool known = false;
++         util_dynarray_foreach(&st->pairs, struct ra_pair, p)
++            known |= p->a == a && poly_equal(&p->e, &pair.e);
++         if (!known)
++            util_dynarray_append_typed(&st->pairs, struct ra_pair, pair);
++      }
++   }
++}
++
++/* The factor whose quotient E is shared by the most other factors (the
++ * taps); none unless at least two share it. */
++static void
++ra_decompose(struct ra_state *st, const struct ra_poly *q, int *a_out, struct ra_poly *e_out,
++             struct ra_poly *b_out)
++{
++   unsigned best = 1;
++   *a_out = -1;
++   *b_out = *q;
++   for (unsigned i = 0; i < q->n; i++) {
++      if (term_pixel(st, &q->t[i]))
++         continue;
++      for (unsigned k = 0; k < q->t[i].n; k++) {
++         const int a = q->t[i].atom[k];
++         struct ra_poly e, rest;
++         if (st->atoms[a].kind != RA_CONST || !ra_quotient(st, q, a, &e, &rest))
++            continue;
++         unsigned shared = 0;
++         util_dynarray_foreach(&st->pairs, struct ra_pair, p)
++            shared += poly_equal(&p->e, &e);
++         if (shared > best) {
++            best = shared;
++            *a_out = a;
++            *e_out = e;
++            *b_out = rest;
++         }
++      }
++   }
++}
++
++/* ---- emission ---- */
++
++static struct ra_ref
++ra_imm(struct ra_state *st, float value)
++{
++   struct grate_fp_shader *fp = st->fp;
++   for (unsigned i = 0; i < fp->num_immediates; i++)
++      for (unsigned c = 0; c < 4; c++)
++         if (fp->immediates[i][c] == value)
++            return (struct ra_ref){.file = TGSI_FILE_IMMEDIATE, .comp = c, .index = i};
++   if (fp->num_immediates >= GRATE_FP_MAX_IMMEDIATES) {
++      st->failed = true;
++      return (struct ra_ref){.file = TGSI_FILE_IMMEDIATE};
++   }
++   const unsigned i = fp->num_immediates++;
++   fp->immediates[i][0] = value;
++   fp->immediates[i][1] = 0.0f;
++   fp->immediates[i][2] = 1.0f;
++   fp->immediates[i][3] = RA_CLAMP_EPS;
++   return (struct ra_ref){.file = TGSI_FILE_IMMEDIATE, .comp = 0, .index = i};
++}
++
++static int
++ra_new_temp(struct ra_state *st)
++{
++   if (st->fp->num_temporaries + 8 >= GRATE_FP_MAX_TEMPS) {
++      st->failed = true;
++      return 0;
++   }
++   return st->fp->num_temporaries++;
++}
++
++static struct ra_ref
++ra_temp_ref(int temp, unsigned comp)
++{
++   return (struct ra_ref){.file = TGSI_FILE_TEMPORARY, .comp = comp, .index = temp};
++}
++
++static void
++ra_emit(struct ra_state *st, unsigned opcode, bool sat, int temp, unsigned comp, unsigned nsrc,
++        struct ra_ref s0, struct ra_ref s1, struct ra_ref s2)
++{
++   struct ra_op op = {.opcode = opcode, .nsrc = nsrc, .comp = comp, .sat = sat, .keep = st->keep,
++                      .temp = temp, .src = {s0, s1, s2}};
++   util_dynarray_append_typed(&st->ops, struct ra_op, op);
++}
++
++/* Pending scalar operations -> TGSI: neighbours with the same opcode,
++ * destination temporary and operand registers become one instruction. */
++static void
++ra_flush(struct ra_state *st)
++{
++   const unsigned count = util_dynarray_num_elements(&st->ops, struct ra_op);
++   const struct ra_op *ops = st->ops.data;
++   for (unsigned k = 0; k < count;) {
++      const struct ra_op *lead = &ops[k];
++      unsigned mask = 1 << lead->comp, last = k;
++      const bool vector = lead->opcode == TGSI_OPCODE_MOV || lead->opcode == TGSI_OPCODE_ADD ||
++                          lead->opcode == TGSI_OPCODE_MUL || lead->opcode == TGSI_OPCODE_MAD;
++      for (unsigned j = k + 1; vector && j < count; j++) {
++         const struct ra_op *op = &ops[j];
++         bool same = op->opcode == lead->opcode && op->sat == lead->sat && op->keep == lead->keep &&
++                     op->temp == lead->temp &&
++                     op->nsrc == lead->nsrc && !(mask & (1 << op->comp));
++         for (unsigned s = 0; same && s < op->nsrc; s++) {
++            same = op->src[s].file == lead->src[s].file && op->src[s].index == lead->src[s].index &&
++                   op->src[s].negate == lead->src[s].negate;
++            /* must not read what the group writes */
++            if (op->src[s].file == TGSI_FILE_TEMPORARY && op->src[s].index == lead->temp &&
++                (mask & (1 << op->src[s].comp)))
++               same = false;
++         }
++         if (!same)
++            break;
++         mask |= 1 << op->comp;
++         last = j;
++      }
++      struct tgsi_full_instruction inst;
++      memset(&inst, 0, sizeof(inst));
++      inst.Instruction.Type = TGSI_TOKEN_TYPE_INSTRUCTION;
++      inst.Instruction.Opcode = lead->opcode;
++      inst.Instruction.Saturate = lead->sat;
++      GRATE_FP_KEEP_PRODUCT(&inst) = lead->keep;
++      inst.Instruction.NumDstRegs = 1;
++      inst.Instruction.NumSrcRegs = lead->nsrc;
++      inst.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
++      inst.Dst[0].Register.Index = lead->temp;
++      inst.Dst[0].Register.WriteMask = mask;
++      for (unsigned s = 0; s < lead->nsrc; s++) {
++         unsigned swizzle[4];
++         for (unsigned c = 0; c < 4; c++)
++            swizzle[c] = lead->src[s].comp;
++         for (unsigned j = k; j <= last; j++)
++            swizzle[ops[j].comp] = ops[j].src[s].comp;
++         struct tgsi_full_src_register *src = &inst.Src[s];
++         src->Register.File = lead->src[s].file;
++         src->Register.Index = lead->src[s].index;
++         src->Register.Negate = lead->src[s].negate;
++         src->Register.SwizzleX = swizzle[0];
++         src->Register.SwizzleY = swizzle[1];
++         src->Register.SwizzleZ = swizzle[2];
++         src->Register.SwizzleW = swizzle[3];
++         if (lead->src[s].file == TGSI_FILE_CONSTANT)
++            src->Register.Dimension = 1; /* CONST[0][index], as nir_to_tgsi writes it */
++      }
++      util_dynarray_append_typed(&st->out, struct tgsi_full_instruction, inst);
++      k = last + 1;
++   }
++   util_dynarray_clear(&st->ops);
++}
++
++static struct ra_ref ra_uniform(struct ra_state *st, const struct ra_poly *p);
++
++static struct ra_ref
++ra_atom_ref(struct ra_state *st, int atom)
++{
++   const struct ra_atom *a = &st->atoms[atom];
++   switch (a->kind) {
++   case RA_CONST:
++      return (struct ra_ref){.file = TGSI_FILE_CONSTANT, .comp = a->index % 4, .index = a->index / 4};
++   case RA_INPUT:
++      return (struct ra_ref){.file = TGSI_FILE_INPUT, .comp = a->index % 4, .index = a->index / 4};
++   case RA_GEN: {
++      struct ra_gen *gen = util_dynarray_element(&st->gens, struct ra_gen, a->index);
++      if (!gen->emitted) {
++         /* hi - lo, then 1 / max(., eps) or max(., 0) */
++         struct ra_poly d;
++         if (!poly_add(&d, &gen->hi, &gen->lo, -1.0f)) {
++            st->failed = true;
++            return ra_temp_ref(0, 0);
++         }
++         struct ra_ref diff = ra_uniform(st, &d);
++         gen = util_dynarray_element(&st->gens, struct ra_gen, a->index);
++         gen->temp = ra_new_temp(st);
++         const struct ra_ref self = ra_temp_ref(gen->temp, 0);
++         ra_emit(st, TGSI_OPCODE_MAX, false, gen->temp, 0, 2, diff,
++                 ra_imm(st, gen->type == RA_GEN_INV ? RA_CLAMP_EPS : 0.0f), self);
++         if (gen->type == RA_GEN_INV)
++            ra_emit(st, TGSI_OPCODE_RCP, false, gen->temp, 0, 1, self, self, self);
++         gen->emitted = true;
++      }
++      return ra_temp_ref(gen->temp, 0);
++   }
++   default:
++      st->failed = true;
++      return ra_temp_ref(0, 0);
++   }
++}
++
++/* A raw uniform word (or its negation) needs no code. */
++static bool
++ra_direct(struct ra_state *st, const struct ra_poly *p, struct ra_ref *ref)
++{
++   if (p->n == 0) {
++      *ref = ra_imm(st, 0.0f);
++      return true;
++   }
++   if (p->n != 1 || p->t[0].n > 1)
++      return false;
++   if (p->t[0].n == 0) {
++      *ref = ra_imm(st, p->t[0].coef);
++      return true;
++   }
++   if (fabsf(p->t[0].coef) != 1.0f)
++      return false;
++   *ref = ra_atom_ref(st, p->t[0].atom[0]);
++   ref->negate = p->t[0].coef < 0.0f;
++   return true;
++}
++
++/* Code for a uniform-only polynomial into (temp, comp): a sum of products. */
++static void
++ra_uniform_into(struct ra_state *st, const struct ra_poly *p, int temp, unsigned comp)
++{
++   const struct ra_ref self = ra_temp_ref(temp, comp);
++   const struct ra_ref scratch = ra_temp_ref(st->scratch, 0);
++   if (p->n == 0) {
++      ra_emit(st, TGSI_OPCODE_MOV, false, temp, comp, 1, ra_imm(st, 0.0f), self, self);
++      return;
++   }
++   for (unsigned i = 0; i < p->n; i++) {
++      const struct ra_term *t = &p->t[i];
++      struct ra_ref f[RA_MAX_ATOMS + 1];
++      unsigned n = 0;
++      for (unsigned k = 0; k < t->n; k++)
++         f[n++] = ra_atom_ref(st, t->atom[k]);
++      if (n == 0 || fabsf(t->coef) != 1.0f)
++         f[n++] = ra_imm(st, fabsf(t->coef));
++      f[0].negate ^= t->coef < 0.0f;
++      /* all but the last two factors go through the scratch scalar */
++      struct ra_ref head = f[0];
++      for (unsigned k = 1; k + 1 < n; k++) {
++         ra_emit(st, TGSI_OPCODE_MUL, false, st->scratch, 0, 2, head, f[k], self);
++         head = scratch;
++      }
++      if (n == 1)
++         ra_emit(st, i ? TGSI_OPCODE_ADD : TGSI_OPCODE_MOV, false, temp, comp, i ? 2 : 1, head, self, self);
++      else if (i)
++         ra_emit(st, TGSI_OPCODE_MAD, false, temp, comp, 3, head, f[n - 1], self);
++      else
++         ra_emit(st, TGSI_OPCODE_MUL, false, temp, comp, 2, head, f[n - 1], self);
++   }
++}
++
++static bool
++ra_cached(struct ra_state *st, const struct ra_poly *p, struct ra_ref *ref)
++{
++   util_dynarray_foreach(&st->cache, struct ra_cached, c) {
++      if (poly_equal(&c->poly, p)) {
++         *ref = c->ref;
++         return true;
++      }
++   }
++   return false;
++}
++
++/* n uniform scalars; in one register (same file and index) if possible, so
++ * that the reading operations can be one vector instruction. */
++static void
++ra_uniforms(struct ra_state *st, const struct ra_poly *p, unsigned n, struct ra_ref *refs)
++{
++   bool together = true, all = true;
++   for (unsigned i = 0; i < n; i++) {
++      if (!ra_direct(st, &p[i], &refs[i]) && !ra_cached(st, &p[i], &refs[i]))
++         all = false;
++      else if (i && (refs[i].file != refs[0].file || refs[i].index != refs[0].index ||
++                     refs[i].negate != refs[0].negate))
++         together = false;
++   }
++   if (all && (together || n == 1))
++      return;
++   if (n > 4) {
++      st->failed = true;
++      return;
++   }
++   const int temp = ra_new_temp(st);
++   for (unsigned i = 0; i < n; i++) {
++      ra_uniform_into(st, &p[i], temp, i);
++      refs[i] = ra_temp_ref(temp, i);
++      struct ra_cached c = {.poly = p[i], .ref = refs[i]};
++      util_dynarray_append_typed(&st->cache, struct ra_cached, c);
++   }
++}
++
++static struct ra_ref
++ra_uniform(struct ra_state *st, const struct ra_poly *p)
++{
++   struct ra_ref ref;
++   ra_uniforms(st, p, 1, &ref);
++   return ref;
++}
++
++/* The per-pixel bases B of all sinks: up to four per temporary, all
++ * computed before the first sink (they only read varyings and uniforms). */
++static void
++ra_emit_bases(struct ra_state *st, const struct ra_poly *bases, unsigned count, struct ra_ref *refs)
++{
++   for (unsigned first = 0; first < count; first += 4) {
++      const unsigned n = MIN2(count - first, 4);
++      const struct ra_poly *b = &bases[first];
++      const int temp = ra_new_temp(st);
++      /* per component: the uniform part, and the pixel atoms in order */
++      struct ra_poly f[4];
++      int atoms[RA_MAX_TERMS * 4];
++      unsigned num_atoms = 0;
++      for (unsigned i = 0; i < n; i++) {
++         struct ra_term tf[RA_MAX_TERMS];
++         unsigned nf = 0;
++         for (unsigned k = 0; k < b[i].n; k++) {
++            const struct ra_term *t = &b[i].t[k];
++            if (!term_pixel(st, t)) {
++               tf[nf++] = *t;
++               continue;
++            }
++            for (unsigned j = 0; j < t->n; j++) {
++               if (!st->atoms[t->atom[j]].pixel)
++                  continue;
++               unsigned q = 0;
++               while (q < num_atoms && atoms[q] != t->atom[j])
++                  q++;
++               if (q == num_atoms)
++                  atoms[num_atoms++] = t->atom[j];
++            }
++         }
++         poly_from_terms(&f[i], tf, nf);
++      }
++      bool started[4] = {false};
++      /* last atom first: B = c1 * p1 + (c2 * p2 + F) */
++      for (int q = num_atoms - 1; q >= 0; q--) {
++         struct ra_poly coef[4];
++         struct ra_ref cref[4], fref[4];
++         unsigned comps[4], m = 0;
++         for (unsigned i = 0; i < n; i++) {
++            struct ra_term tc[RA_MAX_TERMS];
++            unsigned nc = 0;
++            for (unsigned k = 0; k < b[i].n; k++) {
++               const struct ra_term *t = &b[i].t[k];
++               bool hit = false;
++               for (unsigned j = 0; j < t->n; j++)
++                  hit |= t->atom[j] == atoms[q];
++               if (!hit)
++                  continue;
++               struct ra_term r;
++               memset(&r, 0, sizeof(r));
++               r.coef = t->coef;
++               for (unsigned j = 0; j < t->n; j++)
++                  if (t->atom[j] != atoms[q])
++                     r.atom[r.n++] = t->atom[j];
++               tc[nc++] = r;
++            }
++            if (!nc)
++               continue;
++            poly_from_terms(&coef[m], tc, nc);
++            comps[m++] = i;
++         }
++         ra_uniforms(st, coef, m, cref);
++         /* the uniform parts of the components that start here */
++         struct ra_poly fs[4];
++         unsigned nfs = 0;
++         for (unsigned k = 0; k < m; k++)
++            if (!started[comps[k]] && f[comps[k]].n)
++               fs[nfs++] = f[comps[k]];
++         if (nfs)
++            ra_uniforms(st, fs, nfs, fref);
++         nfs = 0;
++         const struct ra_ref pixel = ra_atom_ref(st, atoms[q]);
++         for (unsigned k = 0; k < m; k++) {
++            const unsigned i = comps[k];
++            const struct ra_ref self = ra_temp_ref(temp, i);
++            if (started[i])
++               ra_emit(st, TGSI_OPCODE_MAD, false, temp, i, 3, cref[k], pixel, self);
++            else if (f[i].n)
++               ra_emit(st, TGSI_OPCODE_MAD, false, temp, i, 3, cref[k], pixel, fref[nfs++]);
++            else
++               ra_emit(st, TGSI_OPCODE_MUL, false, temp, i, 2, cref[k], pixel, self);
++            started[i] = true;
++         }
++      }
++      for (unsigned i = 0; i < n; i++)
++         refs[first + i] = ra_temp_ref(temp, i);
++   }
++}
++
++/* ---- dead code ---- */
++
++static void
++ra_dce(struct util_dynarray *instructions)
++{
++   unsigned count = util_dynarray_num_elements(instructions, struct tgsi_full_instruction);
++   struct tgsi_full_instruction *code = instructions->data;
++   uint8_t live[GRATE_FP_MAX_TEMPS] = {0};
++   bool *dead = calloc(count + 1, sizeof(bool));
++   for (int n = (int)count - 1; n >= 0; n--) {
++      struct tgsi_full_instruction *inst = &code[n];
++      if (inst->Instruction.NumDstRegs == 1 && inst->Dst[0].Register.File == TGSI_FILE_TEMPORARY) {
++         struct tgsi_dst_register *dst = &inst->Dst[0].Register;
++         const unsigned mask = dst->WriteMask & live[dst->Index];
++         if (!mask) {
++            dead[n] = true;
++            continue;
++         }
++         switch (inst->Instruction.Opcode) {
++         case TGSI_OPCODE_MOV: case TGSI_OPCODE_ADD: case TGSI_OPCODE_MUL: case TGSI_OPCODE_MAD:
++         case TGSI_OPCODE_MIN: case TGSI_OPCODE_MAX: case TGSI_OPCODE_CMP: case TGSI_OPCODE_SLT:
++         case TGSI_OPCODE_SGE: case TGSI_OPCODE_SEQ:
++            dst->WriteMask = mask; /* per-component operations */
++            break;
++         default:
++            break;
++         }
++         live[dst->Index] &= ~dst->WriteMask;
++      }
++      for (unsigned s = 0; s < inst->Instruction.NumSrcRegs; s++)
++         if (inst->Src[s].Register.File == TGSI_FILE_TEMPORARY)
++            live[inst->Src[s].Register.Index] |= tgsi_util_get_inst_usage_mask(inst, s);
++   }
++   unsigned kept = 0;
++   for (unsigned n = 0; n < count; n++)
++      if (!dead[n])
++         code[kept++] = code[n];
++   free(dead);
++   instructions->size = kept * sizeof(struct tgsi_full_instruction);
++}
++
++bool
++grate_fp_reassociate(struct grate_fp_shader *fp, struct util_dynarray *instructions)
++{
++   const unsigned count = util_dynarray_num_elements(instructions, struct tgsi_full_instruction);
++   const struct tgsi_full_instruction *code = instructions->data;
++   const unsigned saved_temps = fp->num_temporaries, saved_imms = fp->num_immediates;
++   bool changed = false;
++   struct ra_state *st = calloc(1, sizeof(*st));
++   if (!st)
++      return false;
++   st->fp = fp;
++   st->cur = calloc(GRATE_FP_MAX_TEMPS * 4, sizeof(*st->cur));
++   st->has = calloc(GRATE_FP_MAX_TEMPS * 4, 1);
++   util_dynarray_init(&st->minmax, NULL);
++   util_dynarray_init(&st->clamps, NULL);
++   util_dynarray_init(&st->gens, NULL);
++   util_dynarray_init(&st->pairs, NULL);
++   util_dynarray_init(&st->out, NULL);
++   util_dynarray_init(&st->ops, NULL);
++   util_dynarray_init(&st->cache, NULL);
++   if (!st->cur || !st->has || !ra_analyze(st, code, count))
++      goto done;
++
++   /* which factor each coordinate uses */
++   for (unsigned k = 0; k < st->num_sinks; k++)
++      for (unsigned c = 0; c < 2; c++)
++         if (st->sinks[k].mode[c] != RA_KEEP)
++            ra_collect_pairs(st, &st->sinks[k].q[c]);
++   struct ra_poly bases[RA_MAX_SINKS * 2];
++   struct ra_ref base_refs[RA_MAX_SINKS * 2];
++   unsigned num_bases = 0;
++   bool useful = false;
++   for (unsigned k = 0; k < st->num_sinks; k++) {
++      struct ra_sink *sink = &st->sinks[k];
++      for (unsigned c = 0; c < 2; c++) {
++         if (sink->mode[c] == RA_KEEP)
++            continue;
++         ra_decompose(st, &sink->q[c], &sink->a[c], &sink->e[c], &sink->b[c]);
++         useful |= sink->a[c] >= 0;
++         unsigned i = 0;
++         while (i < num_bases && !poly_equal(&bases[i], &sink->b[c]))
++            i++;
++         if (i == num_bases)
++            bases[num_bases++] = sink->b[c];
++      }
++   }
++   /* Without a shared factor the result would be the program we started
++    * from, at best. */
++   if (!useful)
++      goto done;
++
++   st->scratch = ra_new_temp(st);
++   unsigned next = 0;
++   for (unsigned n = 0; n < count && !st->failed; n++) {
++      struct tgsi_full_instruction inst = code[n];
++      if (next < st->num_sinks && st->sinks[next].inst == n) {
++         const struct ra_sink *sink = &st->sinks[next];
++         if (next == 0)
++            ra_emit_bases(st, bases, num_bases, base_refs);
++         const int coord = ra_new_temp(st);
++         /* the affine coordinates first: one MAD if both have a factor */
++         struct ra_poly e[2];
++         struct ra_ref eref[2];
++         unsigned ne = 0;
++         for (unsigned c = 0; c < 2; c++)
++            if (sink->mode[c] == RA_AFFINE && sink->a[c] >= 0)
++               e[ne++] = sink->e[c];
++         if (ne)
++            ra_uniforms(st, e, ne, eref);
++         ne = 0;
++         /* pass 0: the affine coordinates and the saturated halves of the
++          * clamped ones (scratch component 2 + c); pass 1: the rest. Both
++          * clamped coordinates then take two ALU packets, not three. */
++         for (unsigned pass = 0; pass < 2; pass++) {
++            for (unsigned c = 0; c < 2; c++) {
++               const struct ra_ref self = ra_temp_ref(coord, c);
++               if (sink->mode[c] == RA_KEEP) {
++                  if (pass == 1)
++                     ra_emit(st, TGSI_OPCODE_MOV, false, coord, c, 1, sink->keep[c], self, self);
++                  continue;
++               }
++               unsigned i = 0;
++               while (!poly_equal(&bases[i], &sink->b[c]))
++                  i++;
++               const struct ra_ref base = base_refs[i];
++               if (sink->mode[c] == RA_AFFINE && pass == 0) {
++                  if (sink->a[c] >= 0) {
++                     st->keep = true;
++                     ra_emit(st, TGSI_OPCODE_MAD, false, coord, c, 3, ra_atom_ref(st, sink->a[c]), eref[ne++], base);
++                     st->keep = false;
++                  } else {
++                     ra_emit(st, TGSI_OPCODE_MOV, false, coord, c, 1, base, self, self);
++                  }
++               } else if (sink->mode[c] == RA_CLAMPED && pass == 0) {
++                  if (sink->a[c] >= 0) {
++                     const struct ra_ref ec = ra_uniform(st, &sink->e[c]);
++                     st->keep = true;
++                     ra_emit(st, TGSI_OPCODE_MAD, true, coord, 2 + c, 3, ra_atom_ref(st, sink->a[c]), ec, base);
++                     st->keep = false;
++                  } else {
++                     ra_emit(st, TGSI_OPCODE_MOV, true, coord, 2 + c, 1, base, self, self);
++                  }
++               } else if (sink->mode[c] == RA_CLAMPED) {
++                  const struct ra_clamp *cl = util_dynarray_element(&st->clamps, struct ra_clamp, sink->clamp[c]);
++                  const struct ra_ref lo = ra_uniform(st, &cl->lo);
++                  const struct ra_ref hl = ra_atom_ref(st, cl->hl);
++                  ra_emit(st, TGSI_OPCODE_MAD, false, coord, c, 3, ra_temp_ref(coord, 2 + c), hl, lo);
++               }
++            }
++         }
++         ra_flush(st);
++         struct tgsi_src_register *r = &inst.Src[0].Register;
++         r->File = TGSI_FILE_TEMPORARY;
++         r->Index = coord;
++         r->Negate = r->Absolute = r->Indirect = r->Dimension = 0;
++         r->SwizzleX = TGSI_SWIZZLE_X;
++         r->SwizzleY = r->SwizzleZ = r->SwizzleW = TGSI_SWIZZLE_Y;
++         next++;
++         changed = true;
++      }
++      util_dynarray_append_typed(&st->out, struct tgsi_full_instruction, inst);
++   }
++   if (st->failed || !changed) {
++      changed = false;
++      goto done;
++   }
++   util_dynarray_clear(instructions);
++   util_dynarray_append_dynarray(instructions, &st->out);
++   ra_dce(instructions);
++
++done:
++   if (!changed) {
++      fp->num_temporaries = saved_temps;
++      fp->num_immediates = saved_imms;
++   }
++   util_dynarray_fini(&st->minmax);
++   util_dynarray_fini(&st->clamps);
++   util_dynarray_fini(&st->gens);
++   util_dynarray_fini(&st->pairs);
++   util_dynarray_fini(&st->out);
++   util_dynarray_fini(&st->ops);
++   util_dynarray_fini(&st->cache);
++   free(st->cur);
++   free(st->has);
++   free(st);
 +   return changed;
 +}
 diff --git a/src/gallium/drivers/grate/grate_perf.c b/src/gallium/drivers/grate/grate_perf.c

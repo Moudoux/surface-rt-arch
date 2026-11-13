@@ -1,0 +1,10 @@
+# /etc/rtshell/config.toml: rtshell's login screen (`rtshell --greeter` under greetd, user `greeter`).
+# Only keys that differ from the built-in defaults (shell/assets/config.toml). Everything here must be
+# readable by the greeter user (no paths under /home).
+theme = "dark"          # a built-in theme or a file such as /etc/rtshell/theme.toml
+wallpaper = ""          # empty = gradient from the theme; or e.g. /etc/rtshell/wallpaper.jpg
+
+[greeter]
+default_user = "alarm"
+session = ["/usr/local/bin/rtshell-session"]
+env = ["XDG_SESSION_TYPE=wayland", "XDG_SESSION_DESKTOP=rtshell", "XDG_CURRENT_DESKTOP=rtshell"]

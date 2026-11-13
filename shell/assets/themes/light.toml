@@ -1,0 +1,508 @@
+# rtshell theme: design tokens. Every colour, radius, spacing and motion value the shell draws with comes from
+# a file like this one (DESKTOP-SHELL.md 3.6): code outside src/theme/ must not contain literal visual values.
+# Copy to ~/.config/rtshell/theme.toml (or set `theme = "/path/file.toml"` in config.toml) to override;
+# missing keys fall back to this file. Colours are "#rrggbb" or "#rrggbbaa" (straight alpha).
+
+name = "light"
+
+[colors]
+background = "#e9ecf2"   # behind apps, shown when no app is open
+surface = "#ffffff"      # cards and panels
+surface_glass = "#ffffffc8"
+accent = "#3466e0"
+on_accent = "#ffffff"
+text = "#15181e"
+text_dim = "#5c6575"
+scrim = "#00000050"      # dims what is behind dialogs and panels
+
+[shape]
+radius_small = 8
+radius_card = 16
+radius_panel = 20
+
+[spacing]
+unit = 8
+touch_target = 48
+edge_zone = 16
+
+[motion]
+duration_short_ms = 150
+duration_long_ms = 250
+spring_stiffness = 380.0
+spring_damping = 1.0     # 1.0 = critically damped
+
+[cursor]
+theme = "default"        # xcursor theme; falls back to Adwaita, breeze_cursors, then a built-in arrow
+size = 24
+
+[font]
+ui = "Adwaita Sans"      # family names, resolved with fc-match
+mono = "Adwaita Mono"
+size_caption = 13
+size_body = 16
+size_title = 22
+size_display = 76        # clock
+weight_body = 400
+weight_title = 600
+weight_display = 300
+
+[glass]
+tint = "#ffffff80"              # over the blurred wallpaper (straight alpha)
+blur_sigma = 3.0         # texels of the downsampled wallpaper (9-tap shader: keep <= ~3.5)
+blur_levels = 2          # halvings before blurring (2 = 1/4 size; 3 = 1/8 shows bilinear banding)
+blur_passes = 3          # horizontal+vertical rounds; sigmas add in quadrature (3 x 3.0 at 1/4 = ~21 px)
+
+[shadow]
+color = "#1a203040"
+sigma = 14.0
+offset_y = 6.0
+small_sigma = 6.0
+small_offset_y = 2.0
+
+[icons]
+theme = "breeze"             # freedesktop icon theme; its Inherits chain and hicolor are searched too
+
+[wallpaper]
+gradient_end = "#c9d6f2"      # generated wallpaper when none is configured: background -> this, accent glow
+
+[home]
+# Start screen (style "rt"): tiles on a grid of cells, groups side by side, scrolling sideways. Sizes in px.
+title = "Start"
+title_size = 40
+title_weight = 300
+margin_left = 96         # left edge of the first group (and of the title)
+margin_right = 96        # free space after the last group when scrolled to the end
+title_top = 36
+tiles_top = 150          # top of the tile grid (group names sit above it)
+tiles_bottom = 96        # kept free below the grid (All apps button)
+cell = 70                # small tile edge; medium = 2x2 cells (+ gap), wide = 4x2, large = 4x4
+gap = 8
+group_gap = 64
+group_label_size = 18
+tile_radius = 0
+tile_style = "solid"     # "solid" (palette colours) or "glass" (frosted wallpaper, tinted)
+tile_text = "#ffffff"
+tile_palette = ["#2f6fdb", "#7b4bd1", "#c2483e", "#1f9a78", "#c7801a", "#3b7f9e", "#9c3f7a"]
+pressed_scale = 0.95
+tile_icons = [40, 64, 96]  # icon edge on small / medium+wide / large tiles
+# All apps sheet
+list_row = 56            # row height
+list_column = 300        # column width
+list_icon = 40
+letter_size = 28
+search_width = 360
+# Motion
+scroll_stiffness = 120.0 # softer than UI springs: a flick coasts, then settles
+flick_time = 0.4         # s of travel projected from the release velocity
+rubber_band = 0.35       # past an end, content moves this fraction of the finger's travel
+long_press_ms = 500
+
+[springboard]
+# Home for style "ipad" (ui/springboard.rs): pages of app icons with names, page dots, a floating dock (pinned
+# apps + recently launched ones), a search sheet pulled down from the pages. Only used by style "ipad"; the
+# iPad theme files (ipad-light.toml, ipad-dark.toml) tune these. Sizes in px.
+status_height = 26       # top strip: time and date left, battery right
+status_margin = 24
+status_size = 13
+status_weight = 600
+status_text = "#ffffff"
+grid_top = 44            # top of the icon grid
+grid_bottom = 64         # free space between the grid and the dock (page dots sit here)
+grid_margin_x = 48       # left and right of the grid (and of the search results)
+grid_gap_x = 56          # between the widget column and the grid
+status_glyph = 11        # status bar: Wi-Fi bars and battery height
+status_battery_charging = "#34c759"
+# Widget column (landscape, first page; widgets listed in springboard.toml)
+today = true
+today_x = 48
+today_top = 34
+clock_size = 72
+clock_weight = 300
+date_size = 20
+date_weight = 400
+widget_small = 158       # small card edge; wide = 2 x this + gap
+widget_gap = 16
+widget_radius = 22
+widget_padding = 14
+widget_fill = "#ffffff"
+widget_text = "#1c1c1e"
+widget_dim = "#8e8e93"
+widget_accent = "#ff3b30"
+widget_good = "#34c759"
+widget_track = "#0000001a"
+widget_shadow = false
+widget_title_size = 12
+widget_body_size = 13
+widget_big_size = 40
+widget_big_weight = 400
+widget_icon = 22
+columns = 6              # landscape grid
+rows = 4
+columns_portrait = 4
+rows_portrait = 6
+icon = 50                # icon edge (on the plate)
+label_size = 12
+label_weight = 400
+label_gap = 6            # plate to name
+label_color = "#ffffff"
+plate = "solid"          # behind each icon: "none", "solid" (plate_fill) or "glass" (wallpaper frosted with plate_fill)
+plate_fill = "#f4f4f7"
+plate_radius = 16
+plate_padding = 9        # plate edge = icon + 2 x this
+pressed_scale = 0.9
+dots_size = 8
+dots_gap = 10
+dots_offset = 28         # dots centre above the dock top
+dot = "#ffffff59"
+dot_active = "#ffffff"
+dock_height = 92
+dock_icon = 50
+dock_radius = 30
+dock_padding = 12
+dock_gap = 18
+dock_margin = 12         # from the bottom edge
+dock_glass = true
+dock_fill = "#ffffff80"
+dock_shadow = true
+dock_divider = "#00000026"   # between pinned and recent apps
+dock_max = 8
+dock_recent = 3          # recently launched apps after the divider (0 = none)
+badge_size = 24          # edit mode: the remove badge on each page icon
+badge_fill = "#d9dbe0e6"
+badge_text = "#15181e"
+badge_label = "−"
+jiggle = 1.6             # edit mode wobble (px; 0 = still)
+jiggle_hz = 3.2
+done_fill = ""           # edit mode Done button (empty = accent colour)
+done_text = "#ffffff"
+search_pull = 90         # pull this far down (or flick) to open search
+search_width = 520
+search_height = 44
+search_radius = 12
+search_fill = "#0000000f"
+search_text = "#15181e"
+search_placeholder = "#15181e80"
+search_label = "#1c1c1e"      # names under the result icons
+search_tint = "#f2f3f6c0"   # the sheet: wallpaper frosted with this
+search_columns = 8
+search_row = 120         # result grid row height
+search_icon = 56
+toast_fill = "#ffffffe6"
+toast_text = "#15181e"
+toast_radius = 16
+# Motion
+page_stiffness = 260.0   # page snap spring
+flick_time = 0.25        # s of travel projected from the release velocity
+rubber_band = 0.35
+reveal_scale = 0.9       # Home sits back to this while an app covers it
+long_press_ms = 450
+edge_flip_ms = 550       # edit mode: an icon held at the left/right edge flips the page after this
+# Words
+label_done = "Done"
+label_search = "Search"
+label_no_match = "No results"
+label_added = "Added to Home"
+label_dock_full = "The dock is full"
+
+[banner]
+# Notification banners. Default: Windows 8/RT toasts (top-right corner, flat, solid, slide in from the right).
+# Top-centre rounded glass banners instead (iOS/macOS-like): anchor = "center", slide_from = "top",
+# radius = 18, glass = true, fill = "#151a24a0", shadow = true, width = 420, margin = 10.
+anchor = "right"         # "left", "center" or "right"
+slide_from = "right"     # "right" or "top"
+width = 364
+margin = 24              # from the screen edges
+padding = 14
+gap = 8                  # between stacked banners
+radius = 0
+glass = false
+fill = "#1f3f73"
+text = "#ffffff"
+text_dim = "#ffffffb3"
+shadow = false
+icon = 40
+title_size = 16
+body_size = 14
+timeout_ms = 6000        # how long a banner stays (apps may ask for less or more; critical ones stay)
+max_shown = 3
+
+[screenshot]
+# Feedback for Super+Shift+S and Power + Volume-down (saved to the Pictures folder).
+flash = "#ffffffb3"      # full-screen flash, fading out; its alpha is the starting strength
+flash_ms = 260           # 0 = no flash
+banner = true            # a notification naming the file
+icon = "camera-photo"
+
+[settings]
+# The Settings app (Super+I, the Control Center's "All settings"): a full-screen sheet over apps. Default
+# look: Windows 8.1 PC settings (category column left, content right, flat square controls). Rounded
+# iOS-like cards instead: chip_radius = 10, nav_fill = fill, nav_selected = "#ffffff14".
+fill = "#f3f4f7"
+nav_fill = "#e3e6ec"
+nav_width = 300
+nav_selected = ""        # empty = accent colour
+nav_selected_text = "#ffffff"
+nav_row_height = 52
+padding = 40
+title_size = 40
+title_weight = 300
+heading_size = 30
+heading_weight = 300
+label_size = 16
+text = "#15181e"
+text_dim = "#5c6575"
+gap = 22
+label_gap = 8
+chip_min_width = 120
+chip_height = 44
+chip_gap = 6
+chip_radius = 0
+chip_fill = "#0000000f"
+chip_text = "#15181e"
+chip_selected = ""       # empty = accent colour
+chip_selected_text = "#ffffff"
+swatch = 44
+accents = ["#5b8cff", "#3466e0", "#00a3a3", "#2e9e4f", "#8cbf26", "#e6a700", "#f0640a", "#e51400", "#d80073", "#a200ff", "#6a00ff", "#647687"]
+thumb = 128              # the icon loader's size bucket: thumbnails are rasterized at this size
+ring = 4
+fade_ms = 160
+
+[volume]
+# Volume popup (volume keys). Default look: the Windows 8/RT volume indicator (a small flush dark panel in the
+# top-left corner, light here: the level as a number, a vertical bar, the speaker icon; tap the icon = mute, drag the bar).
+# A rounded horizontal glass pill instead (iOS/macOS-like): anchor = "center", anchor_y = "top",
+# orientation = "horizontal", width = 320, height = 56, radius = 28, glass = true, fill = "#151a24a0",
+# shadow = true, track = 6, track_radius = 3, knob_length = 0, margin = 16.
+anchor = "left"          # "left", "center", "right"
+anchor_y = "top"         # "top", "center", "bottom"
+orientation = "vertical" # "vertical" (bar upwards) or "horizontal" (bar to the right)
+margin = 32              # from the screen edges
+width = 64
+height = 232
+padding = 14
+gap = 12
+radius = 0
+glass = false
+fill = "#f3f4f7"
+shadow = false
+text = "#15181e"
+number_size = 22
+number_weight = 300
+track = 8                # bar thickness
+track_fill = "#00000026"
+track_radius = 0
+level_fill = ""          # empty = accent colour
+muted_fill = "#00000059" # the level while muted
+knob = "#1f232b"
+knob_length = 6          # along the bar (0 = no knob)
+knob_thickness = 24      # across the bar
+knob_radius = 0
+icon = 24
+timeout_ms = 2000        # shown this long after the last change or touch
+fade_in_ms = 0           # 0 = appears at once (Windows 8)
+fade_out_ms = 400
+step = 0.04              # change per key press (volume 0-1)
+
+
+[lock]
+# Lock screen (Phase 8). Default look: the Windows 8/RT lock screen. A full-screen "curtain" (the wallpaper with
+# a large clock and the date) lifts with a swipe up, a tap, a click or any key and uncovers the sign-in screen
+# (a solid colour, the user's name, a password box or the PIN pad). Other layouts are new Scenes.
+# A centred iOS-like clock instead: anchor = "center", anchor_y = "top", margin_y = 96, clock_size = 96.
+curtain_scrim = "#00000030"   # darkens the wallpaper on the curtain (straight alpha)
+anchor = "left"               # clock block: "left", "center", "right"
+anchor_y = "bottom"           # "top", "center", "bottom"
+margin_x = 52
+margin_y = 64
+text = "#ffffff"
+clock_size = 112
+clock_weight = 200
+date_size = 34
+date_weight = 300
+status_icon = 24              # battery and Wi-Fi icons under the date (0 = none)
+status_gap = 18
+lift_commit = 0.3             # release beyond this share of the height lifts the curtain
+lift_flick = 500.0            # or an upward flick faster than this (px/s)
+curtain_timeout_ms = 30000    # the curtain drops back (typed text wiped) after this long without input
+signin_glass = false          # true = blurred wallpaper + signin_fill as tint; false = signin_fill solid
+signin_fill = "#e8ebf2"
+signin_text = "#1d2230"
+gap = 16                      # between the sign-in screen's rows
+name_size = 34
+name_weight = 300
+field_width = 320
+field_height = 44
+field_radius = 0
+field_fill = "#ffffff"
+field_text = "#111111"
+field_placeholder = "#777777"
+field_focus = ""              # border while the box has focus (empty = accent colour)
+field_border = 2
+bullet_size = 18
+submit_fill = ""              # the arrow button beside the box (empty = accent colour)
+submit_text = "#ffffff"
+message_size = 16
+message_text = "#1d2230d0"
+error_text = "#b3261e"
+pin_key = 76                  # PIN pad keys (square)
+pin_gap = 8
+pin_radius = 0
+pin_fill = "#0000000f"
+pin_pressed = ""              # empty = accent colour
+pin_text = "#1d2230"
+pin_size = 30
+pin_weight = 300
+# Words on the screen (translate or restyle here).
+label_password = "Password"
+label_pin = "PIN"
+label_submit = "→"
+label_back = "⌫"
+label_ok = "OK"
+label_checking = "Checking…"
+# Login screen (rtshell --greeter) with several people: a row of user tiles after the curtain.
+user_tile = 112               # square with the initial
+user_tile_radius = 0
+user_tile_fill = "#0000000f"
+user_tile_selected = ""       # the picked tile (keyboard), empty = accent colour
+user_initial_size = 48
+user_initial_weight = 300
+user_name_size = 18
+user_gap = 28
+label_switch_user = "Switch user"
+label_signing_in = "Signing in…"
+label_no_users = "There is no account to sign in to."
+
+[demo]
+# --demo test scene (render kit)
+card_width = 176
+card_height = 148
+panel_width = 380
+
+[control]
+# Control Center (swipe in from the right edge, Super+A). Default look: the Windows 8/RT Settings pane (flush
+# with the right edge, full height, flat, square tiles), matching the Start screen. Every look decision is a
+# token here; a different layout altogether is a new Scene in a style bundle (DESKTOP-SHELL.md 3.6).
+# A floating rounded glass card instead (iOS/macOS-like): margin = 12, radius = 20, glass = true,
+# fill = "#151a2470", shadow = true, dim = "#00000059", title = "", toggle_layout = "row", toggle_columns = 2,
+# toggle_height = 68, toggle_radius = 16, slider_track = 6, slider_radius = 3, knob_width = 26, row_radius = 10, field_radius = 10, button_radius = 18,
+# slider_knob = 26, knob_radius = 13, power_fill = false, power_button = 52, power_radius = 26.
+width = 360              # px
+margin = 0               # gap to the screen edges (0 = flush, full height)
+padding = 24
+gap = 20                 # between sections
+radius = 0               # panel corners
+glass = false            # true: frosted wallpaper tinted with `fill`; false: solid `fill`
+fill = "#f3f4f7"
+shadow = false           # drop shadow under the panel and the slider knob
+dim = "#00000000"        # over what is behind the panel when fully open (alpha 0 = nothing drawn)
+title = "Settings"       # empty = no title
+title_size = 40
+title_weight = 300
+time_size = 28
+time_weight = 300
+toggle_off = "#0000000f"   # quick toggle / button background when off (on = accent)
+toggle_layout = "column" # "column": icon on top, label at the bottom (tiles); "row": icon left of the text
+toggle_columns = 3
+toggle_height = 96
+toggle_gap = 8
+toggle_padding = 10
+toggle_radius = 0        # same as home.tile_radius: the toggles look like Start tiles
+toggle_icon = 32
+toggle_label_size = 14
+slider_height = 48       # brightness row (touch area)
+slider_track = 8
+slider_radius = 0
+slider_knob = 28         # knob height
+knob_width = 14
+knob_radius = 0
+knob = "#1f232b"
+power_button = 64        # Lock / Sleep / Restart / Power off button height
+power_fill = true        # true: buttons share the row (tiles); false: power_button wide (round with power_radius)
+power_radius = 0
+power_icon = 32
+section_size = 13        # small headings ("Bluetooth devices")
+devices_max = 3          # paired Bluetooth devices listed
+row_height = 44          # list rows: Bluetooth devices, networks, the "Networks" link
+row_icon = 24
+row_selected = "#0000000f"   # background of the selected (expanded) network
+row_radius = 0
+row_padding = 6          # inset of a network entry (its selected background)
+networks_max = 8         # networks listed on the Networks page
+notes_max = 6            # notifications listed on the Notifications page
+field_height = 40        # password box
+field_fill = "#ffffff"
+field_text = "#1f232b"
+field_radius = 0
+button_height = 36       # Connect / Disconnect / Forget
+button_radius = 0
+# Behaviour
+open_flick = 400.0       # px/s: a flick this fast opens (or closes) whatever the distance
+open_commit = 0.35       # fraction of the panel width pulled in that opens it on release
+confirm_ms = 3000        # Restart / Power off: the second tap must come within this
+
+[osk]
+# See dark.toml for what each token does.
+fill = "#d9dce2"
+key = "#ffffff"
+key_fn = "#c4c8d0"
+key_pressed = "#3466e0"
+key_latched = "#a9afba"
+key_locked = "#3466e0"
+text = "#15181e"
+text_fn = "#30353f"
+preview_fill = "#3466e0"
+preview_text = "#ffffff"
+accent_fill = "#eceef2"
+accent_selected = "#3466e0"
+key_height = 58          # px, landscape; rows of letters
+key_height_portrait = 52
+coding_height = 42       # the coding row (Esc, Tab, Alt, symbols, Home/End, arrows)
+coding_row = true        # show the coding row above the letters
+gap = 6                  # between keys
+padding = 6              # around the keys
+max_width = 0            # px; 0 = keys span the whole width (Windows 8), else centred on the fill
+radius = 0               # key corners
+label_size = 22
+label_weight = 400
+fn_label_size = 15       # Shift, Enter, &123, Ctrl and the coding row
+glyph_size = 24          # symbol labels drawn from the monospace face (⌫ ⇧ ⌨ arrows)
+preview = true           # a bigger copy of the key above the finger (not in password fields)
+preview_height = 1.25    # x key height
+preview_size = 34
+preview_radius = 0
+shadow = false           # drop shadow under the preview and the accent strip
+label_shift = "⇧"
+label_backspace = "⌫"
+label_enter = "Enter"
+label_symbols = "&123"
+label_letters = "abc"
+label_hide = "⌨"
+label_left = "←"
+label_right = "→"
+label_up = "↑"
+label_down = "↓"
+# Behaviour
+long_press_ms = 450      # hold a letter this long for its accents (e.g. e -> é è ê ë)
+repeat_delay_ms = 450    # Backspace and arrows repeat when held
+repeat_ms = 55
+double_tap_ms = 400      # Shift twice = Caps lock; Ctrl/Alt twice = locked
+
+[split]
+# Split view (Phase 7): two apps side by side (top/bottom in portrait) with a divider between them.
+divider = 12               # px between the two apps
+divider_color = "#c9ced8"
+divider_active = "#c9ced8" # while dragged
+handle_length = 44         # the grip in the middle of the divider
+handle_thickness = 4
+handle_color = "#5c6575"
+handle_active = "#3466e0"
+grab_margin = 16           # extra touch width on each side of the divider
+snap_mark = 4              # line where a dragged divider will land
+snap_color = "#3466e0"
+reveal_color = "#ffffff"   # area uncovered while dragging (apps resize on release)
+dismiss_color = "#00000070" # over the app a release would dismiss
+drop_color = "#3466e050"   # Overview: the half a dragged card would take
+drop_zone = 0.25           # Overview: fraction of the screen at each end that takes a dropped card
+snaps = [0.3333, 0.5, 0.6667] # the start (left/top) app's share
+dismiss = 0.5              # released closer to an end than this fraction of the outer snap: dismiss that app
+double_tap_ms = 300        # double tap on the divider swaps the apps

@@ -1,0 +1,116 @@
+#!/bin/sh
+# rtshell-session: the login session's command (greetd's `command`, or `exec rtshell-session` from a text VT).
+# Runs rtshell inside the login session (polkit and the seat judge power actions and the display by the
+# session, which a systemd user unit would not be part of), restarts it after a crash and keeps a crash log.
+# DESKTOP-SHELL.md Phase 8, notes/21.
+#
+#   rtshell-session [rtshell args...]
+# Environment: RTSHELL_BIN (default: ~/rtshell/rtshell, else rtshell next to this script, else from PATH).
+# Files (XDG_STATE_HOME, default ~/.local/state):
+#   rtshell/rtshell.log      this run's log (stderr); the previous run's is rtshell.log.old
+#   rtshell/crash.log        one block per crash: time, exit status, run time, the log's last lines
+#
+# Policy: exit status 0 (Ctrl+Alt+Backspace, SIGTERM at logout) ends the session. 75 is a restart asked for
+# by the user (Settings > Personalize > Restart rtshell): started again at once, not a crash. Anything else is a crash:
+# rtshell is started again (locked, if the session was locked: logind's LockedHint survives the crash),
+# unless it crashed 3 times within 60 s, then the session ends (greetd shows the login screen again).
+# The log never holds typed text or passwords (rtshell does not log them).
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/rtshell
+mkdir -p "$STATE" || exit 1
+HERE=$(cd "$(dirname "$0")" && pwd)
+# Picked again before every start, so a restart (Settings, crash) runs a build deployed since sign-in.
+pick_bin() {
+  BIN=${RTSHELL_BIN:-}
+  if [ -z "$BIN" ]; then
+    # The deploy location first (build/shell/deploy.sh: a new build needs no root), then the rtshell next to
+    # this script (/usr/local/bin when installed for greetd), then PATH.
+    if [ -x "$HOME/rtshell/rtshell" ]; then BIN=$HOME/rtshell/rtshell
+    elif [ -x "$HERE/rtshell" ]; then BIN=$HERE/rtshell
+    else BIN=rtshell; fi
+  fi
+}
+export RUST_BACKTRACE=1 RUST_LOG=${RUST_LOG:-info}
+# Tells rtshell it can offer "Restart rtshell" (it will be started again).
+export RTSHELL_SUPERVISED=1
+RESTART=75
+unset WAYLAND_DISPLAY DISPLAY
+
+MAX_CRASHES=3
+WINDOW=60
+crashes=""      # start times (s) of recent crashes
+child=""
+stopping=""
+
+stop() {
+  stopping=1
+  [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+}
+trap stop TERM INT HUP
+
+locked_hint() {
+  [ -n "$XDG_SESSION_ID" ] || return 1
+  [ "$(loginctl show-session "$XDG_SESSION_ID" -p LockedHint --value 2>/dev/null)" = yes ]
+}
+
+signame() {
+  if [ "$1" -gt 128 ]; then
+    n=$(( $1 - 128 ))
+    echo "signal $n ($(kill -l "$n" 2>/dev/null || echo ?))"
+  else
+    echo "exit $1"
+  fi
+}
+
+extra=""
+while :; do
+  pick_bin
+  [ -f "$STATE/rtshell.log" ] && mv -f "$STATE/rtshell.log" "$STATE/rtshell.log.old"
+  start=$(date +%s)
+  echo "== $(date -Is) $BIN $extra $* (session ${XDG_SESSION_ID:-?})" > "$STATE/rtshell.log"
+  # shellcheck disable=SC2086
+  "$BIN" $extra "$@" >> "$STATE/rtshell.log" 2>&1 &
+  child=$!
+  # `wait` returns early when a trapped signal arrives; wait again until rtshell is really gone.
+  while :; do
+    wait "$child"; rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  child=""
+  end=$(date +%s)
+  echo "== $(date -Is) $(signame "$rc") after $((end - start)) s" >> "$STATE/rtshell.log"
+  if [ "$rc" -eq 0 ] || [ -n "$stopping" ]; then
+    exit 0
+  fi
+  if [ "$rc" -eq "$RESTART" ]; then
+    extra=""
+    continue
+  fi
+
+  {
+    echo "=== $(date -Is) rtshell crashed: $(signame "$rc") after $((end - start)) s (session ${XDG_SESSION_ID:-?})"
+    tail -n 60 "$STATE/rtshell.log"
+    echo
+  } >> "$STATE/crash.log"
+  # Keep the crash log small (the newest ~256 KB).
+  if [ "$(wc -c < "$STATE/crash.log")" -gt 262144 ]; then
+    tail -c 196608 "$STATE/crash.log" > "$STATE/crash.log.tmp" && mv -f "$STATE/crash.log.tmp" "$STATE/crash.log"
+  fi
+
+  recent=""
+  n=0
+  for t in $crashes $end; do
+    if [ $((end - t)) -lt "$WINDOW" ]; then recent="$recent $t"; n=$((n + 1)); fi
+  done
+  crashes=$recent
+  if [ "$n" -ge "$MAX_CRASHES" ]; then
+    echo "=== $(date -Is) $n crashes within ${WINDOW} s: giving up (session ends)" >> "$STATE/crash.log"
+    exit 1
+  fi
+  extra=""
+  if locked_hint; then
+    extra="--locked"
+  fi
+  echo "=== restarting${extra:+ locked}" >> "$STATE/crash.log"
+  sleep 1
+done

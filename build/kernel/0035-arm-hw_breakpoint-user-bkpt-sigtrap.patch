@@ -1,0 +1,21 @@
+diff --git a/arch/arm/kernel/hw_breakpoint.c b/arch/arm/kernel/hw_breakpoint.c
+index cd4b34c96..349940950 100644
+--- a/arch/arm/kernel/hw_breakpoint.c
++++ b/arch/arm/kernel/hw_breakpoint.c
+@@ -965,6 +965,16 @@ static int hw_breakpoint_pending(unsigned long addr, unsigned int fsr,
+ 		watchpoint_handler(addr, fsr, regs);
+ 		break;
+ 	case ARM_ENTRY_CFI_BREAKPOINT:
++		/*
++		 * MOE 0b0011 is any BKPT instruction, not only a kernel CFI
++		 * trap. A user-space BKPT (e.g. Chromium's IMMEDIATE_CRASH)
++		 * must get SIGTRAP; "handling" it here returns to the same
++		 * instruction and the task spins forever.
++		 */
++		if (user_mode(regs) || !IS_ENABLED(CONFIG_CFI)) {
++			ret = 1;
++			break;
++		}
+ 		hw_breakpoint_cfi_handler(regs);
+ 		break;
+ 	default:

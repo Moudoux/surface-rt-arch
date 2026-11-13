@@ -1,0 +1,131 @@
+diff --git a/anvil/src/udev.rs b/anvil/src/udev.rs
+index 5783566..b2efb31 100644
+--- a/anvil/src/udev.rs
++++ b/anvil/src/udev.rs
+@@ -106,13 +106,13 @@ use tracing::{debug, error, info, trace, warn};
+ // - we might need some work-arounds, if one supports modifiers, but the other does not
+ //
+ // So lets just pick `ARGB2101010` (10-bit) or `ARGB8888` (8-bit) for now, they are widely supported.
++// Surface RT: grate (Tegra 3) can sample ABGR8888 but cannot render to it, so ARGB/XRGB come first.
+ const SUPPORTED_FORMATS: &[Fourcc] = &[
+-    Fourcc::Abgr2101010,
+-    Fourcc::Argb2101010,
+-    Fourcc::Abgr8888,
+     Fourcc::Argb8888,
++    Fourcc::Xrgb8888,
++    Fourcc::Abgr8888,
+ ];
+-const SUPPORTED_FORMATS_8BIT_ONLY: &[Fourcc] = &[Fourcc::Abgr8888, Fourcc::Argb8888];
++const SUPPORTED_FORMATS_8BIT_ONLY: &[Fourcc] = SUPPORTED_FORMATS;
+ 
+ type UdevRenderer<'a> = MultiRenderer<
+     'a,
+@@ -869,7 +869,8 @@ impl AnvilState<UdevData> {
+             drm,
+             allocator,
+             framebuffer_exporter,
+-            Some(gbm),
++            // Surface RT debugging: ANVIL_NO_CURSOR_PLANE renders the cursor with GL instead of plane 87.
++            (std::env::var("ANVIL_NO_CURSOR_PLANE").is_err()).then_some(gbm),
+             color_formats.iter().copied(),
+             render_formats,
+         );
+diff --git a/src/backend/drm/gbm.rs b/src/backend/drm/gbm.rs
+index ef4d8c7..67e1011 100644
+--- a/src/backend/drm/gbm.rs
++++ b/src/backend/drm/gbm.rs
+@@ -65,6 +65,12 @@ impl Framebuffer for GbmFramebuffer {
+ /// This tries to import the buffer to gbm and attach a [`framebuffer::Handle`] for
+ /// the imported [`BufferObject`][gbm::BufferObject].
+ ///
++#[cfg(feature = "wayland_frontend")]
++fn scanout_invalid_modifier() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("SMITHAY_SCANOUT_INVALID_MODIFIER").map_or(true, |v| v != "0"))
++}
++
+ /// Returns `Ok(None)` for unknown buffer types and buffer types that do not
+ /// support attaching a framebuffer (e.g. shm-buffers)
+ #[cfg(feature = "wayland_frontend")]
+@@ -89,6 +95,14 @@ pub fn framebuffer_from_wayland_buffer<A: AsFd + 'static>(
+                 drm, gbm, dmabuf, use_opaque, false,
+             )?));
+         }
++        // surface-rt: Tegra (grate) GBM buffers allocated without modifiers are linear, and Chromium's
++        // buffers (minigbm) come without modifiers. Scan them out through the legacy AddFB2 path
++        // (no modifier = LINEAR for the tegra driver). SMITHAY_SCANOUT_INVALID_MODIFIER=0 disables it.
++        if scanout_invalid_modifier() {
++            return Ok(Some(framebuffer_from_dmabuf(
++                drm, gbm, dmabuf, use_opaque, true,
++            )?));
++        }
+     }
+ 
+     #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+diff --git a/src/backend/renderer/gles/mod.rs b/src/backend/renderer/gles/mod.rs
+index 913239b..b65108a 100644
+--- a/src/backend/renderer/gles/mod.rs
++++ b/src/backend/renderer/gles/mod.rs
+@@ -1377,6 +1377,14 @@ impl GlesRenderer {
+         unsafe {
+             self.gl.BindTexture(target, tex);
+             self.gl.EGLImageTargetTexture2DOES(target, image);
++            // surface-rt: like the SHM path. GL's default for TEXTURE_2D is REPEAT, which grate (Tegra 3)
++            // implements for non-power-of-two textures by wrapping at the next lower power of two: a
++            // 1366x768 dmabuf showed up as a 2x2 grid (notes/13). Clamping is also right on any driver
++            // (no linear-filter bleed from the opposite edge).
++            self.gl
++                .TexParameteri(target, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
++            self.gl
++                .TexParameteri(target, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+             self.gl.BindTexture(target, 0);
+         }
+ 
+diff --git a/src/xwayland/xwm/surface.rs b/src/xwayland/xwm/surface.rs
+index d8a850a..aec7a74 100644
+--- a/src/xwayland/xwm/surface.rs
++++ b/src/xwayland/xwm/surface.rs
+@@ -2146,6 +2146,43 @@ impl IsAlive for X11Surface {
+     }
+ }
+ 
++impl X11Surface {
++    /// Give this window the X input focus (SetInputFocus and/or WM_TAKE_FOCUS, by its input model), as the
++    /// keyboard `enter` does. For compositors whose keyboard focus is the window's `WlSurface` (surface-rt
++    /// patch): call it after focusing that surface. Returns false if the window takes no input.
++    pub fn take_input_focus(&self) -> bool {
++        let (set_input_focus, send_take_focus) = match self.input_model() {
++            WmInputModel::None => return false,
++            WmInputModel::Passive => (true, false),
++            WmInputModel::LocallyActive => (true, true),
++            WmInputModel::GloballyActive => (false, true),
++        };
++        if let Some(release) = &self.focus_release {
++            release.cancel();
++        }
++        if let Some(conn) = self.conn.upgrade() {
++            if set_input_focus {
++                if let Err(err) = conn.set_input_focus(InputFocus::NONE, self.window, x11rb::CURRENT_TIME) {
++                    warn!("Unable to set focus for X11Surface ({:?}): {}", self.window, err);
++                }
++            }
++            if send_take_focus {
++                let event = ClientMessageEvent::new(
++                    32,
++                    self.window,
++                    self.atoms.WM_PROTOCOLS,
++                    [self.atoms.WM_TAKE_FOCUS, x11rb::CURRENT_TIME, 0, 0, 0],
++                );
++                if let Err(err) = conn.send_event(false, self.window, EventMask::NO_EVENT, event) {
++                    warn!("Unable to send take focus event for X11Surface ({:?}): {}", self.window, err);
++                }
++            }
++            let _ = conn.flush();
++        }
++        true
++    }
++}
++
+ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
+     fn enter(&self, seat: &Seat<D>, data: &mut D, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+         let (set_input_focus, send_take_focus) = match self.input_model() {

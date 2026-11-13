@@ -1,0 +1,9 @@
+# /etc/greetd/config.toml for rtshell's login screen (installed by rtshell-greetd-install.sh;
+# the stock file is kept as /etc/greetd/config.toml.orig). DESKTOP-SHELL.md Phase 8.
+[terminal]
+vt = 1
+
+[default_session]
+# The greeter: rtshell's lock-screen scene with a user picker, no apps. Logs: journalctl -t rtshell
+command = "/usr/local/bin/rtshell --greeter --journal"
+user = "greeter"

@@ -57,7 +57,7 @@ if fetch surface-rt-patches https://github.com/ThatzOkay/surface-rt-patches main
 fi
 P=$S/surface-rt-patches/patches
 
-# Kernel: libre-tegra v7.0.1-stable + surface-rt-patches 0001, 0002, 0023-0029 + ours 0030-0034
+# Kernel: libre-tegra v7.0.1-stable + surface-rt-patches 0001, 0002, 0023-0029 + ours 0030-0035
 if fetch libre-tegra_linux https://codeberg.org/libre-tegra/linux refs/tags/v7.0.1-stable \
      bfffc6d6656e87f3de3aa4c09d852849081ef088; then
   series libre-tegra_linux "$P"/0001-*.patch "$P"/0002-*.patch "$P"/002[3-9]-*.patch
@@ -68,7 +68,7 @@ fi
 if fetch libre-tegra_mesa https://github.com/external-mirrors/libre-tegra-mesa grate-26.2.3 \
      2a7bf9cc5eb1b9ab07373c1814cd1320073af450; then
   series libre-tegra_mesa "$P"/mesa/00*.patch
-  ours libre-tegra_mesa "$top"/build/mesa/grate-26.2.3-25.patch
+  ours libre-tegra_mesa "$top"/build/mesa/grate-26.2.3-34.patch
 fi
 
 # U-Boot: mainline, unmodified (surface-rt_defconfig)
@@ -81,6 +81,13 @@ if fetch Open-Surface-RT_fusee-tools https://github.com/Open-Surface-RT/fusee-to
   git -C "$S/Open-Surface-RT_fusee-tools" submodule -q update --init --depth 1
   [ "$(git -C "$S/Open-Surface-RT_fusee-tools/fusee-launcher-new" rev-parse HEAD)" = e3fbcbb2cc8d5d8ba52de2adfaf1c2fa97a5bc2f ] \
     || { echo "fusee-launcher-new: unexpected submodule commit"; exit 1; }
+fi
+
+# Smithay (Wayland compositor library) for rtshell (shell/, built with build/shell/build.sh): master at a
+# pinned commit + ours (GLES2/grate fixes, X11 input focus for Xwayland)
+if fetch smithay https://github.com/Smithay/smithay.git master \
+     d09642ccba702c772f9a4837b78c63ce7f14229d; then
+  ours smithay "$top"/build/shell/smithay-surface-rt.patch
 fi
 
 # Arch packaging repos for the KDE packages we rebuild (build/kde/build.sh <name>)

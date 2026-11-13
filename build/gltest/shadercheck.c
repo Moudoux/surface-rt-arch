@@ -8,7 +8,7 @@
  *   shadercheck FS_xxx.glsl|VS_xxx.glsl|x.frag|x.vert ...
  * Prints per file: "<name> drew rgba=(...)" or "<name> COMPILE/LINK FAILED".
  * GLES2 shaders (KWin's: "#extension GL_OES_..." without #version) get a GLES 2
- * context instead, detected from the first file, or forced with SHADERCHECK_ES=1.
+ * context instead (also "#version 100", ANGLE/Chromium), detected from the first file, or forced with SHADERCHECK_ES=1.
  * Build: build/gltest/build.sh (also builds this).
  */
 #define GL_GLEXT_PROTOTYPES 1
@@ -86,7 +86,8 @@ int main(int argc, char **argv)
    bool es = getenv("SHADERCHECK_ES") != NULL;
    if (argc > 1) {
       char *first = slurp(argv[1]);
-      es |= strstr(first, "#extension GL_OES") && !strstr(first, "#version 1");
+      es |= (strstr(first, "#extension GL_OES") && !strstr(first, "#version 1")) ||
+            strstr(first, "#version 100") != NULL; /* ESSL 1.00 (Chromium/ANGLE) */
       free(first);
    }
    static const EGLint es_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
